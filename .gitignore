@@ -1,0 +1,14 @@
+node_modules/
+main.js
+main.js.map
+*.js.map
+.DS_Store
+.idea/
+.vscode/
+data.json
+
+# Local one-off patch scripts created during development.
+scripts/_*
+
+# Keep packaged release runtime files in GitHub install folder.
+!release/**/main.js
