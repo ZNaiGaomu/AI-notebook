@@ -81,53 +81,119 @@
 
 ## 安装与更新
 
-### 从 Release 安装（推荐）
+### 方式 A：从 GitHub Release 安装（推荐，开箱即用）
 
 1. 打开 [Releases](https://github.com/ZNaiGaomu/AI-notebook/releases)  
-2. 下载最新 `ai-notebook-vX.Y.Z.zip`（或仓库内 `release/ai-notebook/`）  
-3. 解压后得到 `manifest.json` / `main.js` / `styles.css`  
-4. 复制到：
+2. 下载 **`ai-notebook-vX.Y.Z.zip`**（Release 附件，不是 Source code）  
+3. 解压后应直接看到：
+
+```text
+manifest.json
+main.js
+styles.css
+（可能还有 README.txt）
+```
+
+4. 将上述文件放到：
+
+```text
+<你的 Obsidian 库>/.obsidian/plugins/ai-notebook/
+```
+
+文件夹名建议为 **`ai-notebook`**（与插件 ID 一致）。
+
+5. Obsidian → **设置 → 社区插件** → 关闭「受限模式」→ 启用 **AI 记录本**  
+6. （可选）在插件设置中添加 AI 服务商（Base URL + API Key + 模型）
+
+### 方式 B：从 Tag 页面下载「Source code」压缩包（需自己找到构建产物）
+
+在 [Tags](https://github.com/ZNaiGaomu/AI-notebook/tags) 点 `v0.2.0` 的 **zip / tar.gz**，下载的是**整个源码仓库快照**，**不能**把解压根目录整夹当插件用。
+
+正确用法：
+
+1. 解压 Source code  
+2. 进入其中的构建好的安装目录：
+
+```text
+AI-notebook-0.2.0/          （解压后的仓库根，名称可能略有不同）
+  └── release/ai-notebook/
+        ├── manifest.json
+        ├── main.js
+        ├── styles.css
+        └── README.txt
+```
+
+3. **只复制** `release/ai-notebook/` 里的运行文件到：
 
 ```text
 <你的库>/.obsidian/plugins/ai-notebook/
 ```
 
-5. Obsidian → 设置 → 社区插件 → 关闭受限模式 → 启用 **AI 记录本**  
+4. 启用插件（同上）
 
-### 使用本仓库已构建目录
+> **对比**  
+> | 下载物 | 能否直接当插件 |  
+> |--------|----------------|  
+> | Release 附件 `ai-notebook-v0.2.0.zip` | ✅ 解压即装 |  
+> | Tag / Code 的 Source code zip | ❌ 需进到 `release/ai-notebook/` 再装 |  
+> | 源码根目录（含 `src/`、`package.json`） | ❌ 需 `npm run build` 后才有 main.js |
+
+若你本机已 clone 仓库，也可直接复制：
 
 ```text
-release/ai-notebook/
-  manifest.json
-  main.js
-  styles.css
-  README.txt
+release/ai-notebook/  →  .obsidian/plugins/ai-notebook/
 ```
 
-整夹覆盖到 `plugins/ai-notebook/` 即可。
+### 更新插件
 
-### 更新注意
+- 覆盖目标目录中的 `manifest.json`、`main.js`、`styles.css`  
+- **不要删除** `data.json`（本机 API Key、Provider、路径设置等）  
+- 更新后建议：禁用再启用插件，或重启 Obsidian  
 
-- 可覆盖 `manifest.json`、`main.js`、`styles.css`  
-- **不要删除** 目标目录中的 `data.json`（含本机 API Key 与设置）  
-- 更新后建议：**禁用再启用插件**，或重启 Obsidian  
-
-### 从源码构建
+### 从源码自己构建
 
 ```bash
+git clone https://github.com/ZNaiGaomu/AI-notebook.git
+cd AI-notebook
 npm install
 npm test
 npm run package
 ```
 
-产物：
+然后将 `release/ai-notebook/` 复制到 plugins 目录。
 
-```text
-release/ai-notebook/          # 当前安装包
-release/history/v0.2.0/       # 本版存档
+开发时：
+
+```bash
+npm run build    # 生产构建并同步到 release/ai-notebook
+npm run dev      # watch，改代码后自动同步
 ```
 
-开发时 `npm run build` 会自动同步到 `release/ai-notebook/`。
+---
+
+## 隐私与数据边界（开源 ≠ 公开你的库）
+
+### 仓库 / Tag / Release 里有没有你的密钥？
+
+对当前仓库做了扫描（含常见 `sk-`、私钥头、`data.json` 等），**未发现真实 API Key 或私人笔记被提交进 Git**。
+
+| 内容 | 是否在开源仓库中 |
+|------|------------------|
+| 插件源码与构建的 `main.js` | ✅ 公开（给别人部署用） |
+| 你的 API Key | ❌ 只在你本机 `data.json` / 用户配置，且已在 `.gitignore` |
+| 你的笔记、条目、对话历史、上传文件 | ❌ 只在你的 Obsidian 库里 |
+
+别人 star / 下载 Tag / 下载 Source code，得到的是**空配置的软件**，需要他们自己在设置里填自己的 Key。
+
+### 什么时候内容会离开你的电脑？
+
+仅当你在本机配置了 AI 并调用时，请求会发往**你填写的**服务商（OpenAI 兼容接口等），可能包含对话、条目摘要、图片等——这是「你 → 你的 API 提供商」，**不是**「你 → 其他 GitHub 用户」。
+
+### 部署者需要知道的
+
+- 自己准备 OpenAI 兼容的 Base URL 与 API Key  
+- 配置只保存在**自己的**库 / 本机  
+- 不要把带真实 Key 的 `data.json` 提交到公开仓库  
 
 ---
 

@@ -28,3 +28,10 @@ Obsidian → 设置 → 社区插件 → 关闭受限模式 → 启用「AI 记�
 【注意】
 - 覆盖更新时不要删除库内该目录下的 data.json（API Key 等本机配置）
 - 本文件夹仅含运行文件；源码在项目根目录
+
+【从 GitHub Tag 下载 Source code 时】
+解压后请进入 release/ai-notebook/ 再复制 manifest.json、main.js、styles.css
+到 .obsidian/plugins/ai-notebook/。不要把整个源码仓库当插件目录。
+
+【隐私】
+本安装包不含任何 API Key 或笔记。密钥仅保存在你本机启用后的 data.json。
