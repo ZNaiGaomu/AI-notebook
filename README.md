@@ -14,19 +14,61 @@
 
 ## 目录
 
-1. [0.2.0 亮点](#020-亮点)
-2. [功能总览](#功能总览)
-3. [安装与更新](#安装与更新)
-4. [快速上手](#快速上手)
-5. [浮层助手（写笔记）](#浮层助手写笔记)
-6. [改功能（改蓝图）](#改功能改蓝图)
-7. [AI 与多模型路由](#ai-与多模型路由)
-8. [附件、历史与路径设置](#附件历史与路径设置)
-9. [手机与收件箱](#手机与收件箱)
-10. [命令一览](#命令一览)
-11. [开发与打包](#开发与打包)
-12. [版本说明](#版本说明)
-13. [注意与隐私](#注意与隐私)
+1. [只要这一小份就能用](#只要这一小份就能用)
+2. [0.2.0 亮点](#020-亮点)
+3. [功能总览](#功能总览)
+4. [安装与更新](#安装与更新)
+5. [快速上手](#快速上手)
+6. [浮层助手（写笔记）](#浮层助手写笔记)
+7. [改功能（改蓝图）](#改功能改蓝图)
+8. [AI 与多模型路由](#ai-与多模型路由)
+9. [附件、历史与路径设置](#附件历史与路径设置)
+10. [手机与收件箱](#手机与收件箱)
+11. [命令一览](#命令一览)
+12. [开发与打包](#开发与打包)
+13. [版本说明](#版本说明)
+14. [隐私与数据边界](#隐私与数据边界)
+
+---
+
+## 只要这一小份就能用
+
+**结论：只需要 `release/ai-notebook/` 里的文件，不必下载/解压整个仓库。**
+
+仓库里还有 `src/`、`docs/`、`tests/` 等，那是**开发与构建**用的。插件运行时已经打进 `main.js`，**不依赖** GitHub 仓库、不依赖源码目录，也和别人的密钥/笔记无关。
+
+### 最终只要这 3 个文件
+
+```text
+.obsidian/plugins/ai-notebook/
+  ├── manifest.json   # 插件身份与版本
+  ├── main.js         # 全部逻辑（已打包）
+  └── styles.css      # 样式
+```
+
+| 你拷什么 | 能否正常运行 |
+|----------|----------------|
+| **仅** `release/ai-notebook/`（上面 3 个文件） | ✅ 可以 |
+| 整个仓库（源码 + 文档 + 测试） | 能 clone，但**装插件时用不到**，纯多余 |
+| Tag 的 Source code 整夹当插件目录 | ❌ 不行（见下） |
+
+### 最短安装步骤
+
+1. 取得安装文件（任选其一）：
+   - **推荐**：Releases 里的 `ai-notebook-vX.Y.Z.zip`（解压即是这 3 个文件）  
+   - 或：仓库 / 本机路径里的 [`release/ai-notebook/`](release/ai-notebook/)  
+   - 或：Tag 的 Source code zip → **只进入**其中的 `release/ai-notebook/`  
+2. 复制到：`<你的库>/.obsidian/plugins/ai-notebook/`  
+3. 设置 → 社区插件 → 关闭受限模式 → 启用 **AI 记录本**  
+4. （可选）在插件设置里自己填 Base URL、API Key、模型  
+
+**更新**：只覆盖这 3 个文件；**不要删** 同目录下的 `data.json`（你自己的 Key 与设置）。
+
+### 和「整仓下载」的关系
+
+- **没有**「必须整仓才能跑」的关联。  
+- 别人部署 = 拷运行包 + **自己**配 API；不会读到你本机的密钥或笔记。  
+- 只有要改代码、跑测试时，才需要完整 clone 并 `npm install` / `npm run build`。
 
 ---
 
@@ -81,119 +123,61 @@
 
 ## 安装与更新
 
-### 方式 A：从 GitHub Release 安装（推荐，开箱即用）
+> 核心就一句：**只装 `release/ai-notebook` 三文件即可**，见上文 [只要这一小份就能用](#只要这一小份就能用)。
 
-1. 打开 [Releases](https://github.com/ZNaiGaomu/AI-notebook/releases)  
-2. 下载 **`ai-notebook-vX.Y.Z.zip`**（Release 附件，不是 Source code）  
-3. 解压后应直接看到：
+### 方式 A：Release 安装包（推荐）
 
-```text
-manifest.json
-main.js
-styles.css
-（可能还有 README.txt）
-```
+1. [Releases](https://github.com/ZNaiGaomu/AI-notebook/releases) → 下载 **`ai-notebook-vX.Y.Z.zip`**（附件，不是 Source code）  
+2. 解压得到 `manifest.json`、`main.js`、`styles.css`  
+3. 放入 `<库>/.obsidian/plugins/ai-notebook/`  
+4. 启用插件 →（可选）配置自己的 API  
 
-4. 将上述文件放到：
+### 方式 B：只用仓库里的 `release/ai-notebook`
+
+仓库体积大时，**不必**整仓克隆。只要拿到：
 
 ```text
-<你的 Obsidian 库>/.obsidian/plugins/ai-notebook/
+release/ai-notebook/manifest.json
+release/ai-notebook/main.js
+release/ai-notebook/styles.css
 ```
 
-文件夹名建议为 **`ai-notebook`**（与插件 ID 一致）。
+复制到 `.obsidian/plugins/ai-notebook/` 即可运行。与整仓其它文件**无运行时依赖**。
 
-5. Obsidian → **设置 → 社区插件** → 关闭「受限模式」→ 启用 **AI 记录本**  
-6. （可选）在插件设置中添加 AI 服务商（Base URL + API Key + 模型）
+### 方式 C：从 Tag 的 Source code zip
 
-### 方式 B：从 Tag 页面下载「Source code」压缩包（需自己找到构建产物）
+[Tags](https://github.com/ZNaiGaomu/AI-notebook/tags) 上的 **zip / tar.gz** = **整个源码树**，不能当插件根目录。
 
-在 [Tags](https://github.com/ZNaiGaomu/AI-notebook/tags) 点 `v0.2.0` 的 **zip / tar.gz**，下载的是**整个源码仓库快照**，**不能**把解压根目录整夹当插件用。
+解压后进入 **`release/ai-notebook/`**，再只拷上述 3 个文件去 plugins。
 
-正确用法：
+### 对照表
 
-1. 解压 Source code  
-2. 进入其中的构建好的安装目录：
+| 下载物 | 能否直接当插件 |
+|--------|----------------|
+| Release 的 `ai-notebook-v*.zip` | ✅ 解压即装 |
+| 仅 `release/ai-notebook/` 三文件 | ✅ 可直接装 |
+| Tag / Code 的 Source code zip 根目录 | ❌ 须进入 `release/ai-notebook/` |
+| 含 `src/`、`package.json` 的源码根 | ❌ 须先 `npm run build` |
 
-```text
-AI-notebook-0.2.0/          （解压后的仓库根，名称可能略有不同）
-  └── release/ai-notebook/
-        ├── manifest.json
-        ├── main.js
-        ├── styles.css
-        └── README.txt
-```
+### 更新
 
-3. **只复制** `release/ai-notebook/` 里的运行文件到：
+- 只覆盖 `manifest.json`、`main.js`、`styles.css`  
+- **保留** `data.json`（本机 Key 与设置）  
+- 建议禁用再启用插件，或重启 Obsidian  
 
-```text
-<你的库>/.obsidian/plugins/ai-notebook/
-```
-
-4. 启用插件（同上）
-
-> **对比**  
-> | 下载物 | 能否直接当插件 |  
-> |--------|----------------|  
-> | Release 附件 `ai-notebook-v0.2.0.zip` | ✅ 解压即装 |  
-> | Tag / Code 的 Source code zip | ❌ 需进到 `release/ai-notebook/` 再装 |  
-> | 源码根目录（含 `src/`、`package.json`） | ❌ 需 `npm run build` 后才有 main.js |
-
-若你本机已 clone 仓库，也可直接复制：
-
-```text
-release/ai-notebook/  →  .obsidian/plugins/ai-notebook/
-```
-
-### 更新插件
-
-- 覆盖目标目录中的 `manifest.json`、`main.js`、`styles.css`  
-- **不要删除** `data.json`（本机 API Key、Provider、路径设置等）  
-- 更新后建议：禁用再启用插件，或重启 Obsidian  
-
-### 从源码自己构建
+### 从源码构建（仅开发需要）
 
 ```bash
 git clone https://github.com/ZNaiGaomu/AI-notebook.git
 cd AI-notebook
-npm install
-npm test
-npm run package
+npm install && npm test && npm run package
+# 产物：release/ai-notebook/
 ```
-
-然后将 `release/ai-notebook/` 复制到 plugins 目录。
-
-开发时：
 
 ```bash
-npm run build    # 生产构建并同步到 release/ai-notebook
-npm run dev      # watch，改代码后自动同步
+npm run build   # 生产构建并同步 release/ai-notebook
+npm run dev     # 开发 watch
 ```
-
----
-
-## 隐私与数据边界（开源 ≠ 公开你的库）
-
-### 仓库 / Tag / Release 里有没有你的密钥？
-
-对当前仓库做了扫描（含常见 `sk-`、私钥头、`data.json` 等），**未发现真实 API Key 或私人笔记被提交进 Git**。
-
-| 内容 | 是否在开源仓库中 |
-|------|------------------|
-| 插件源码与构建的 `main.js` | ✅ 公开（给别人部署用） |
-| 你的 API Key | ❌ 只在你本机 `data.json` / 用户配置，且已在 `.gitignore` |
-| 你的笔记、条目、对话历史、上传文件 | ❌ 只在你的 Obsidian 库里 |
-
-别人 star / 下载 Tag / 下载 Source code，得到的是**空配置的软件**，需要他们自己在设置里填自己的 Key。
-
-### 什么时候内容会离开你的电脑？
-
-仅当你在本机配置了 AI 并调用时，请求会发往**你填写的**服务商（OpenAI 兼容接口等），可能包含对话、条目摘要、图片等——这是「你 → 你的 API 提供商」，**不是**「你 → 其他 GitHub 用户」。
-
-### 部署者需要知道的
-
-- 自己准备 OpenAI 兼容的 Base URL 与 API Key  
-- 配置只保存在**自己的**库 / 本机  
-- 不要把带真实 Key 的 `data.json` 提交到公开仓库  
 
 ---
 
@@ -343,12 +327,27 @@ docs/                规格与说明
 
 ---
 
-## 注意与隐私
+## 隐私与数据边界
 
-- API Key 保存在插件 `data.json` / 库内用户配置，**不写入**笔记正文  
-- 对话上传可存到库内或用户指定目录；默认永久保留  
-- 助手写入会真实修改 Markdown，请定期备份库  
-- 公网隧道会暴露访问入口，请妥善保管链接与 token  
+### 开源仓库里有什么 / 没有什么
+
+| 内容 | 是否在 GitHub 仓库中 |
+|------|----------------------|
+| 源码、`main.js` 安装包 | ✅ 有（供他人自行部署） |
+| 你的 API Key | ❌ 无（只在本机 `data.json`，已 gitignore） |
+| 你的笔记 / 对话 / 上传文件 | ❌ 无（只在你自己的 Obsidian 库） |
+
+别人下载 `release/ai-notebook` 或 Source code，得到的是**空配置软件**，须自己填写自己的 Key。
+
+### 数据何时会离开本机
+
+仅当你在本机配置了 AI 并调用时，请求发往**你填写的**服务商，可能含对话、条目摘要、图片等。这是「你 → 你的 API」，不是「你 → 其他 GitHub 用户」。
+
+### 使用者注意
+
+- 自行准备 OpenAI 兼容 Base URL 与 API Key  
+- 不要把含真实 Key 的 `data.json` 提交到公开仓库  
+- 助手写入会修改 Markdown，请备份库  
 
 ---
 
