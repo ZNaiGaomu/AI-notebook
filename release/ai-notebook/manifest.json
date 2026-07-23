@@ -1,10 +1,10 @@
 {
 	"id": "ai-notebook",
 	"name": "AI 记录本",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"minAppVersion": "1.5.0",
-	"description": "多实例 AI 记录本：可版本化功能蓝图、独立数据存储、可配置 AI Provider。",
+	"description": "多实例 AI 记录本：可版本化功能蓝图、浮层助手真写入、多模型回退、对话附件与手机入口。",
 	"author": "zn217",
-	"authorUrl": "",
+	"authorUrl": "https://github.com/ZNaiGaomu",
 	"isDesktopOnly": false
 }

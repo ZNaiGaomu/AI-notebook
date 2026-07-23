@@ -4,6 +4,7 @@ import type {
 	ProviderProfile,
 	PurposeRouting,
 } from "../domain/types";
+import { normalizeRouteChain } from "../domain/purposeRouting";
 
 /**
  * Durable user config stored OUTSIDE the plugin install folder:
@@ -49,9 +50,9 @@ export class UserConfigStore {
 						? (data.defaultProviderId ?? null)
 						: null,
 				purposeRouting: {
-					planner: normalizeRoute(data.purposeRouting?.planner),
-					worker: normalizeRoute(data.purposeRouting?.worker),
-					voice: normalizeRoute(data.purposeRouting?.voice),
+					planner: normalizeRouteChain(data.purposeRouting?.planner),
+					worker: normalizeRouteChain(data.purposeRouting?.worker),
+					voice: normalizeRouteChain(data.purposeRouting?.voice),
 				},
 				updatedAt:
 					typeof data.updatedAt === "string" ? data.updatedAt : undefined,
@@ -99,21 +100,6 @@ export class UserConfigStore {
 			updatedAt: new Date().toISOString(),
 		};
 	}
-}
-
-function normalizeRoute(
-	route: { providerId?: string | null; model?: string | null } | undefined,
-): { providerId: string | null; model: string | null } {
-	return {
-		providerId:
-			typeof route?.providerId === "string" || route?.providerId === null
-				? (route?.providerId ?? null)
-				: null,
-		model:
-			typeof route?.model === "string" || route?.model === null
-				? (route?.model ?? null)
-				: null,
-	};
 }
 
 function normalizeProvider(p: unknown): ProviderProfile {

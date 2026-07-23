@@ -7,6 +7,7 @@ import { mkdir, copyFile, writeFile, readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { syncRelease } from "./sync-release.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = join(root, "release", "ai-notebook");
@@ -20,6 +21,9 @@ if (build.status !== 0) {
 	process.exit(build.status ?? 1);
 }
 
+// build already syncs release/; keep explicit + history archive
+await syncRelease({ quiet: false });
+
 const manifest = JSON.parse(
 	await readFile(join(root, "manifest.json"), "utf8"),
 );
@@ -30,7 +34,6 @@ await mkdir(outDir, { recursive: true });
 await mkdir(historyDir, { recursive: true });
 
 for (const file of ["manifest.json", "main.js", "styles.css"]) {
-	await copyFile(join(root, file), join(outDir, file));
 	await copyFile(join(root, file), join(historyDir, file));
 }
 

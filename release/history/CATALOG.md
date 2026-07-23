@@ -5,3 +5,4 @@
 | 版本 | 路径 |
 |------|------|
 | 0.1.1 | release/history/v0.1.1/ |
+| 0.2.0 | release/history/v0.2.0/ |

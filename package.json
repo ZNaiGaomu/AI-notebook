@@ -1,12 +1,13 @@
 {
 	"name": "ai-notebook",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "AI 记录本 — 可版本化能力蓝图驱动的多实例 Obsidian 插件",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"sync:release": "node scripts/sync-release.mjs",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"package": "node scripts/package-release.mjs",

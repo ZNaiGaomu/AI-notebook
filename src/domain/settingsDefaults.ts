@@ -1,6 +1,11 @@
 import type { AiNotebookSettings } from "./types";
+import { normalizeRouteChain } from "./purposeRouting";
 
 export const SETTINGS_SCHEMA_VERSION = 1;
+
+function emptyChain() {
+	return normalizeRouteChain([]);
+}
 
 export function createDefaultSettings(): AiNotebookSettings {
 	return {
@@ -8,15 +13,17 @@ export function createDefaultSettings(): AiNotebookSettings {
 		providers: [],
 		defaultProviderId: null,
 		purposeRouting: {
-			planner: { providerId: null, model: null },
-			worker: { providerId: null, model: null },
-			voice: { providerId: null, model: null },
+			planner: emptyChain(),
+			worker: emptyChain(),
+			voice: emptyChain(),
 		},
 		paths: {
 			notebooksRoot: "AI Notebooks",
 			attachmentsRoot: "attachments/ai-notebook",
 			inboxRoot: "AI Inbox",
+			chatUploadsRoot: null,
 		},
+		chatUploadRetentionDays: null,
 		privacy: {
 			attachTopKItems: false,
 			topK: 5,
@@ -63,9 +70,9 @@ export function normalizeSettings(raw: unknown): AiNotebookSettings {
 				? r.defaultProviderId
 				: null,
 		purposeRouting: {
-			planner: normalizeRoute(r.purposeRouting?.planner),
-			worker: normalizeRoute(r.purposeRouting?.worker),
-			voice: normalizeRoute(r.purposeRouting?.voice),
+			planner: normalizeRouteChain(r.purposeRouting?.planner),
+			worker: normalizeRouteChain(r.purposeRouting?.worker),
+			voice: normalizeRouteChain(r.purposeRouting?.voice),
 		},
 		paths: {
 			notebooksRoot:
@@ -73,14 +80,25 @@ export function normalizeSettings(raw: unknown): AiNotebookSettings {
 					? r.paths.notebooksRoot.trim()
 					: base.paths.notebooksRoot,
 			attachmentsRoot:
-				typeof r.paths?.attachmentsRoot === "string" && r.paths.attachmentsRoot.trim()
+				typeof r.paths?.attachmentsRoot === "string" &&
+				r.paths.attachmentsRoot.trim()
 					? r.paths.attachmentsRoot.trim()
 					: base.paths.attachmentsRoot,
 			inboxRoot:
 				typeof r.paths?.inboxRoot === "string" && r.paths.inboxRoot.trim()
 					? r.paths.inboxRoot.trim()
 					: base.paths.inboxRoot,
+			chatUploadsRoot:
+				typeof r.paths?.chatUploadsRoot === "string" &&
+				r.paths.chatUploadsRoot.trim()
+					? r.paths.chatUploadsRoot.trim().replace(/\\/g, "/")
+					: null,
 		},
+		chatUploadRetentionDays:
+			typeof r.chatUploadRetentionDays === "number" &&
+			r.chatUploadRetentionDays > 0
+				? Math.floor(r.chatUploadRetentionDays)
+				: null,
 		privacy: {
 			attachTopKItems: Boolean(r.privacy?.attachTopKItems),
 			topK:
@@ -188,21 +206,6 @@ function normalizePluginHistoryField(
 				? raw.preferredPluginVersion
 				: null,
 		userNotes: notes,
-	};
-}
-
-function normalizeRoute(
-	route: { providerId?: string | null; model?: string | null } | undefined,
-): { providerId: string | null; model: string | null } {
-	return {
-		providerId:
-			typeof route?.providerId === "string" || route?.providerId === null
-				? (route?.providerId ?? null)
-				: null,
-		model:
-			typeof route?.model === "string" || route?.model === null
-				? (route?.model ?? null)
-				: null,
 	};
 }
 

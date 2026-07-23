@@ -153,11 +153,25 @@ export type ProviderProfile = {
 	defaultModel: string;
 };
 
-export type PurposeRouting = {
-	planner: { providerId: string | null; model: string | null };
-	worker: { providerId: string | null; model: string | null };
-	voice: { providerId: string | null; model: string | null };
+/** One ordered slot in a purpose → model chain (fallback order). */
+export type RouteSlot = {
+	providerId: string | null;
+	model: string | null;
 };
+
+/**
+ * Per-purpose ordered provider/model chain.
+ * Index 0 is tried first; on capability miss or request failure, try the next slot.
+ * Empty chain (or all-null slots) falls back to defaultProviderId.
+ */
+export type PurposeRouting = {
+	planner: RouteSlot[];
+	worker: RouteSlot[];
+	voice: RouteSlot[];
+};
+
+/** Max ordered fallbacks shown in settings UI. */
+export const PURPOSE_ROUTE_CHAIN_LEN = 3;
 
 export type AiNotebookSettings = {
 	schemaVersion: number;
@@ -169,7 +183,18 @@ export type AiNotebookSettings = {
 		attachmentsRoot: string;
 		/** Mobile / quick dump folder inside vault (synced by Obsidian Sync etc.) */
 		inboxRoot: string;
+		/**
+		 * Where chat uploads are stored (relative to vault root).
+		 * Default: `{attachmentsRoot}/chat-uploads`
+		 * Empty/null → use default. Changing this does not move existing files.
+		 */
+		chatUploadsRoot: string | null;
 	};
+	/**
+	 * Chat upload retention in days. null = permanent (default).
+	 * Only applies to chat-upload archive files not required by other features.
+	 */
+	chatUploadRetentionDays: number | null;
 	privacy: {
 		attachTopKItems: boolean;
 		topK: number;

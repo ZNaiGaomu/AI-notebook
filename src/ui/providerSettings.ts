@@ -2,6 +2,8 @@ import { Notice, Setting } from "obsidian";
 import type AiNotebookPlugin from "../main";
 import { createId } from "../domain/ids";
 import type { ProviderProfile } from "../domain/types";
+import { PURPOSE_ROUTE_CHAIN_LEN } from "../domain/types";
+import { normalizeRouteChain } from "../domain/purposeRouting";
 import { AiGateway } from "../infra/aiGateway";
 import { USER_CONFIG_FILENAME } from "../infra/userConfigStore";
 
@@ -132,43 +134,115 @@ export function renderProviderSection(
 		renderProviderCard(containerEl, plugin, gateway, profile, redisplay);
 	}
 
-	// —— purpose routing ——
-	containerEl.createEl("h3", { text: "用途 → 服务商" });
+	// —— purpose routing (ordered multi-model chains) ——
+	containerEl.createEl("h3", { text: "用途 → 服务商（有序回退）" });
 	containerEl.createEl("p", {
-		text: "不同功能可走不同服务商；留空则用默认服务商。",
+		text:
+			"每个用途可配置顺序 1→2→3。前一个模型不支持所需能力（如看图）或请求失败时，自动切换下一个；全部留空则用默认服务商。",
 		cls: "setting-item-description",
 	});
-	renderRoute(containerEl, plugin, "planner", "改功能 / 规划");
-	renderRoute(containerEl, plugin, "worker", "整理 / 助手");
-	renderRoute(containerEl, plugin, "voice", "语音转写");
+	renderRouteChain(containerEl, plugin, "planner", "改功能 / 规划", redisplay);
+	renderRouteChain(containerEl, plugin, "worker", "整理 / 助手", redisplay);
+	renderRouteChain(containerEl, plugin, "voice", "语音转写", redisplay);
 }
 
-function renderRoute(
+function renderRouteChain(
 	containerEl: HTMLElement,
 	plugin: AiNotebookPlugin,
 	key: "planner" | "worker" | "voice",
 	label: string,
+	redisplay: () => void,
 ): void {
-	new Setting(containerEl).setName(label).addDropdown((d) => {
-		d.addOption("", "跟随默认");
-		for (const p of plugin.settings.providers) {
-			d.addOption(p.id, p.name || p.id.slice(0, 8));
-		}
-		d.setValue(plugin.settings.purposeRouting[key].providerId ?? "");
-		d.onChange(async (v) => {
-			plugin.settings = {
-				...plugin.settings,
-				purposeRouting: {
-					...plugin.settings.purposeRouting,
-					[key]: {
-						...plugin.settings.purposeRouting[key],
-						providerId: v || null,
-					},
-				},
-			};
-			await plugin.saveSettings();
-		});
+	const chain = normalizeRouteChain(plugin.settings.purposeRouting[key]);
+	const block = containerEl.createDiv({ cls: "ai-notebook-route-chain" });
+	block.createEl("div", {
+		cls: "ai-notebook-route-chain-title",
+		text: label,
 	});
+
+	for (let i = 0; i < PURPOSE_ROUTE_CHAIN_LEN; i++) {
+		const slot = chain[i] ?? { providerId: null, model: null };
+		const row = new Setting(block).setName(`顺序 ${i + 1}`);
+
+		row.addDropdown((d) => {
+			d.addOption("", "（空 / 跟随默认）");
+			for (const p of plugin.settings.providers) {
+				d.addOption(p.id, p.name || p.id.slice(0, 8));
+			}
+			d.setValue(slot.providerId ?? "");
+			d.onChange(async (v) => {
+				const nextChain = normalizeRouteChain(
+					plugin.settings.purposeRouting[key],
+				).map((s, idx) =>
+					idx === i
+						? {
+								providerId: v || null,
+								// reset model when provider changes
+								model: v ? s.model : null,
+							}
+						: s,
+				);
+				// clear model if provider changed and old model not in new provider
+				if (v) {
+					const prof = plugin.settings.providers.find((p) => p.id === v);
+					const cur = nextChain[i]!;
+					if (
+						cur.model &&
+						prof &&
+						!prof.models.includes(cur.model) &&
+						cur.model !== prof.defaultModel
+					) {
+						nextChain[i] = { ...cur, model: null };
+					}
+				}
+				plugin.settings = {
+					...plugin.settings,
+					purposeRouting: {
+						...plugin.settings.purposeRouting,
+						[key]: nextChain,
+					},
+				};
+				await plugin.saveSettings();
+				redisplay();
+			});
+		});
+
+		row.addDropdown((d) => {
+			d.addOption("", "服务商默认模型");
+			const pid = slot.providerId;
+			const prof = pid
+				? plugin.settings.providers.find((p) => p.id === pid)
+				: null;
+			if (prof) {
+				for (const m of prof.models) {
+					d.addOption(m, m);
+				}
+				if (
+					slot.model &&
+					!prof.models.includes(slot.model)
+				) {
+					d.addOption(slot.model, `${slot.model}（自定义）`);
+				}
+			}
+			d.setValue(slot.model ?? "");
+			d.setDisabled(!pid);
+			d.onChange(async (v) => {
+				const nextChain = normalizeRouteChain(
+					plugin.settings.purposeRouting[key],
+				).map((s, idx) =>
+					idx === i ? { ...s, model: v || null } : s,
+				);
+				plugin.settings = {
+					...plugin.settings,
+					purposeRouting: {
+						...plugin.settings.purposeRouting,
+						[key]: nextChain,
+					},
+				};
+				await plugin.saveSettings();
+			});
+		});
+	}
 }
 
 function renderProviderCard(

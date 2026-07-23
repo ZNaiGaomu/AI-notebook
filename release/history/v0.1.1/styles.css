@@ -219,6 +219,54 @@
 	resize: vertical;
 }
 
+.ai-notebook-chat-attach-bar {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	align-items: center;
+	margin: 4px 0 6px;
+	min-height: 1.2em;
+}
+
+.ai-notebook-chat-attach-empty {
+	font-size: 0.8em;
+	color: var(--text-faint);
+}
+
+.ai-notebook-chat-attach-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 2px 8px;
+	border-radius: 999px;
+	border: 1px solid var(--background-modifier-border);
+	background: var(--background-primary);
+	font-size: 0.8em;
+	max-width: 100%;
+}
+
+.ai-notebook-chat-attach-chip button {
+	padding: 0 4px;
+	min-width: 0;
+	border: none;
+	background: transparent;
+	cursor: pointer;
+	color: var(--text-muted);
+}
+
+.ai-notebook-route-chain {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 10px;
+	padding: 8px 12px 4px;
+	margin: 10px 0 14px;
+	background: var(--background-secondary);
+}
+
+.ai-notebook-route-chain-title {
+	font-weight: 600;
+	margin-bottom: 4px;
+}
+
 .ai-notebook-mode-badge {
 	display: inline-block;
 	padding: 2px 8px;

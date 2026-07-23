@@ -32,6 +32,8 @@ describe("chat history context", () => {
 			id: "t1",
 			mode: "assistant",
 			notebookId: "n1",
+				itemId: "item-1",
+				itemTitle: "note",
 			title: "test",
 			createdAt: "a",
 			updatedAt: "b",

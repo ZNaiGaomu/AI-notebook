@@ -5,6 +5,10 @@ import type {
 	ProviderProfile,
 } from "../domain/types";
 import type { ChatMessage } from "../infra/aiGateway";
+import {
+	resolveProviderChain,
+	type Purpose,
+} from "./providerResolver";
 
 /** Minimal gateway surface for orchestration (class or mock). */
 export type ChatGateway = {
@@ -64,13 +68,14 @@ export class FeatureOrchestrator {
 		private readonly versions: VersionService,
 		private readonly getSettings: () => AiNotebookSettings,
 		private readonly resolveProvider: (
-			purpose: "planner" | "worker" | "voice",
+			purpose: Purpose,
 		) => { profile: ProviderProfile; model: string } | null,
 	) {}
 
 	/**
 	 * Call AI to produce a new blueprint from natural language.
 	 * Does NOT commit; caller must confirm then commit.
+	 * Tries purposeRouting.planner chain (顺序1→2→3) on request failure.
 	 */
 	async propose(
 		folderName: string,
@@ -82,8 +87,17 @@ export class FeatureOrchestrator {
 			return { ok: false, error: "请输入要修改的功能描述" };
 		}
 
-		const resolved = this.resolveProvider("planner");
-		if (!resolved) {
+		const settings = this.getSettings();
+		const chain = resolveProviderChain(settings, "planner", null);
+		const fallback = this.resolveProvider("planner");
+		const candidates =
+			chain.length > 0
+				? chain
+				: fallback
+					? [{ ...fallback, slotIndex: 1 }]
+					: [];
+
+		if (candidates.length === 0) {
 			return {
 				ok: false,
 				error: "未配置 AI Provider。请先在设置中添加 Base URL、API Key 与模型。",
@@ -96,97 +110,101 @@ export class FeatureOrchestrator {
 		const maxRetries = opts?.maxRetries ?? 2;
 		let lastError = "";
 		let lastRaw = "";
+		const tried: string[] = [];
 
-		for (let attempt = 0; attempt <= maxRetries; attempt++) {
-			const messages: ChatMessage[] = [
-				{ role: "system", content: SYSTEM_PROMPT },
-				{
-					role: "user",
-					content: [
-						"## 当前蓝图",
-						JSON.stringify(current, null, 2),
-						"",
-						"## 用户修改要求",
-						instruction,
-						attempt > 0
-							? `\n## 上次输出校验失败，请修正后重新输出完整 JSON\n${lastError}`
-							: "",
-					].join("\n"),
-				},
-			];
+		for (const resolved of candidates) {
+			tried.push(`${resolved.profile.name}/${resolved.model}`);
+			for (let attempt = 0; attempt <= maxRetries; attempt++) {
+				const messages: ChatMessage[] = [
+					{ role: "system", content: SYSTEM_PROMPT },
+					{
+						role: "user",
+						content: [
+							"## 当前蓝图",
+							JSON.stringify(current, null, 2),
+							"",
+							"## 用户修改要求",
+							instruction,
+							attempt > 0
+								? `\n## 上次输出校验失败，请修正后重新输出完整 JSON\n${lastError}`
+								: "",
+						].join("\n"),
+					},
+				];
 
-			const chat = await this.gateway.chat(
-				resolved.profile,
-				resolved.model,
-				messages,
-				{ maxTokens: 4096, temperature: 0.2 },
-			);
-			if (!chat.ok) {
-				return { ok: false, error: `AI 请求失败: ${chat.error}` };
+				const chat = await this.gateway.chat(
+					resolved.profile,
+					resolved.model,
+					messages,
+					{ maxTokens: 4096, temperature: 0.2 },
+				);
+				if (!chat.ok) {
+					lastError = `AI 请求失败: ${chat.error}`;
+					// try next provider in chain
+					break;
+				}
+				lastRaw = chat.content;
+				const extracted = extractJsonObject(chat.content);
+				if (!extracted.ok) {
+					lastError = extracted.error;
+					continue;
+				}
+
+				const summary =
+					typeof extracted.value.changeSummary === "string"
+						? extracted.value.changeSummary
+						: "AI 更新功能配置";
+				const bpRaw = extracted.value.blueprint ?? extracted.value;
+				const candidate =
+					bpRaw && typeof bpRaw === "object" && "$schema" in (bpRaw as object)
+						? bpRaw
+						: extracted.value.blueprint;
+
+				if (!candidate) {
+					lastError = "JSON 中缺少 blueprint 字段";
+					continue;
+				}
+
+				const normalized = {
+					...(candidate as object),
+					$schema: "ai-notebook-blueprint/v1",
+					blueprintVersion:
+						typeof (candidate as Blueprint).blueprintVersion === "number"
+							? (candidate as Blueprint).blueprintVersion
+							: current.blueprintVersion,
+					ui: {
+						primaryView: "list",
+						homePrompt:
+							(candidate as Blueprint).ui?.homePrompt ?? current.ui.homePrompt,
+						featureEditPrompt:
+							(candidate as Blueprint).ui?.featureEditPrompt ??
+							current.ui.featureEditPrompt,
+					},
+				};
+
+				const parsed = parseBlueprint(normalized);
+				if (!parsed.ok) {
+					lastError = parsed.error;
+					continue;
+				}
+
+				const blueprint = assertBlueprint(parsed.data);
+				const diff = this.versions.diffBlueprints(current, blueprint);
+				return {
+					ok: true,
+					plan: {
+						blueprint,
+						changeSummary: summary,
+						diff,
+						rawModelText: lastRaw,
+					},
+				};
 			}
-			lastRaw = chat.content;
-			const extracted = extractJsonObject(chat.content);
-			if (!extracted.ok) {
-				lastError = extracted.error;
-				continue;
-			}
-
-			const summary =
-				typeof extracted.value.changeSummary === "string"
-					? extracted.value.changeSummary
-					: "AI 更新功能配置";
-			const bpRaw = extracted.value.blueprint ?? extracted.value;
-			// if model returned blueprint at root without wrapper
-			const candidate =
-				bpRaw && typeof bpRaw === "object" && "$schema" in (bpRaw as object)
-					? bpRaw
-					: extracted.value.blueprint;
-
-			if (!candidate) {
-				lastError = "JSON 中缺少 blueprint 字段";
-				continue;
-			}
-
-			// normalize required constants
-			const normalized = {
-				...(candidate as object),
-				$schema: "ai-notebook-blueprint/v1",
-				blueprintVersion:
-					typeof (candidate as Blueprint).blueprintVersion === "number"
-						? (candidate as Blueprint).blueprintVersion
-						: current.blueprintVersion,
-				ui: {
-					primaryView: "list",
-					homePrompt:
-						(candidate as Blueprint).ui?.homePrompt ?? current.ui.homePrompt,
-					featureEditPrompt:
-						(candidate as Blueprint).ui?.featureEditPrompt ??
-						current.ui.featureEditPrompt,
-				},
-			};
-
-			const parsed = parseBlueprint(normalized);
-			if (!parsed.ok) {
-				lastError = parsed.error;
-				continue;
-			}
-
-			const blueprint = assertBlueprint(parsed.data);
-			const diff = this.versions.diffBlueprints(current, blueprint);
-			return {
-				ok: true,
-				plan: {
-					blueprint,
-					changeSummary: summary,
-					diff,
-					rawModelText: lastRaw,
-				},
-			};
 		}
 
 		return {
 			ok: false,
-			error: `AI 输出的蓝图未通过校验（已重试）: ${lastError}`,
+			error: `AI 输出的蓝图未通过校验（已试 ${tried.join(" → ") || "无模型"}）: ${lastError}`,
 		};
 	}
 

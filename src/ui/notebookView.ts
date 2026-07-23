@@ -10,7 +10,7 @@ import type {
 	NotebookItem,
 	NotebookMeta,
 } from "../domain/types";
-import { formatDateTimeLocal } from "../domain/ids";
+import { createId, formatDateTimeLocal } from "../domain/ids";
 import { projectItem } from "../services/schemaMigrator";
 import {
 	filterItems,
@@ -32,6 +32,31 @@ import {
 	VaultFileSuggestModal,
 	pickLocalFiles,
 } from "./vaultFilePickers";
+import {
+	AssistantActionRunner,
+	assistantToolSystemAppendix,
+	maybeInferEmbedActions,
+	parseAssistantResponse,
+	type PendingChatFile,
+} from "../services/assistantActions";
+import {
+	persistChatUpload,
+	toChatMessageAttachments,
+} from "../services/chatUploadStore";
+import {
+	isVisionCapabilityError,
+	resolveProviderChain,
+} from "../services/providerResolver";
+import type { ChatContentPart, ChatMessage } from "../infra/aiGateway";
+import {
+	ChatFloatPanel,
+	type QueuedSend,
+	type SendFollowMode,
+} from "./chatFloatPanel";
+import {
+	ChatPickItemModal,
+	ChatPickNotebookModal,
+} from "./chatContextPickers";
 
 export const VIEW_TYPE_AI_NOTEBOOK = "ai-notebook-view";
 
@@ -51,6 +76,24 @@ export class NotebookView extends ItemView {
 	private assistantThread: ChatThread | null = null;
 	private featureThread: ChatThread | null = null;
 	private chatBusy = false;
+	private chatThinking = false;
+	/** Files staged for the next assistant send (reference-only by default). */
+	private pendingChatFiles: PendingChatFile[] = [];
+	/** Files for embed_in_body within current item session (option A). */
+	private sessionChatFiles: PendingChatFile[] = [];
+	private sessionFilesItemKey: string | null = null;
+	/** Keep float expanded across remounts when user is chatting. */
+	private chatFloatWantOpen = false;
+	/**
+	 * User clicked「新对话」: next ensureThread must create, not restore latest.
+	 * Cleared after a new thread is created or user opens an old history thread.
+	 */
+	private forceNewAssistantThread = false;
+	private sendFollowMode: SendFollowMode = "queue";
+	private sendQueue: QueuedSend[] = [];
+	/** Guide lines appended into the in-flight assistant turn. */
+	private guideBuffer: string[] = [];
+	private chatFloat: ChatFloatPanel | null = null;
 
 	constructor(leaf: WorkspaceLeaf, plugin: AiNotebookPlugin) {
 		super(leaf);
@@ -73,6 +116,13 @@ export class NotebookView extends ItemView {
 		this.notebookId = id;
 		this.viewModeInitialized = false;
 		this.listFilters = {};
+		this.activeItem = null;
+		this.assistantThread = null;
+		this.featureThread = null;
+		this.sessionChatFiles = [];
+		this.sessionFilesItemKey = null;
+		this.chatFloatWantOpen = false;
+		this.forceNewAssistantThread = false;
 		await this.reload();
 	}
 
@@ -81,6 +131,8 @@ export class NotebookView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
+		this.chatFloat?.destroy();
+		this.chatFloat = null;
 		this.contentEl.empty();
 	}
 
@@ -206,109 +258,103 @@ export class NotebookView extends ItemView {
 		}
 
 
-		const chat = el.createDiv({ cls: "ai-notebook-chat-panel" });
-		const modeBar = chat.createDiv({ cls: "ai-notebook-chat-modebar" });
-		const assistantBtn = modeBar.createEl("button", { text: "助手" });
-		const featureBtn = modeBar.createEl("button", { text: "改功能" });
-		const historyBtn = modeBar.createEl("button", { text: "历史" });
-		const newChatBtn = modeBar.createEl("button", { text: "新对话" });
-
-		const threadTitle = chat.createDiv({ cls: "ai-notebook-chat-thread-title" });
-		const messagesEl = chat.createDiv({ cls: "ai-notebook-chat-messages" });
-		const hint = chat.createDiv({ cls: "ai-notebook-chat-hint" });
-		const inputRow = chat.createDiv({ cls: "ai-notebook-chat-input-row" });
-		const ta = inputRow.createEl("textarea");
-		ta.rows = 2;
-		ta.placeholder =
-			this.chatMode === "feature"
-				? this.blueprint?.ui.featureEditPrompt ??
-					"描述你想如何改这个记录本的功能…"
-				: this.blueprint?.ui.homePrompt ?? "向助手提问…";
-		const sendBtn = inputRow.createEl("button", { text: "发送" });
-		sendBtn.addClass("mod-cta");
-
-		const paintMessages = () => {
-			const thread =
-				this.chatMode === "feature"
-					? this.featureThread
-					: this.assistantThread;
-			threadTitle.setText(
-				thread
-					? `对话：${thread.title}（${thread.messages.length} 条上下文）`
-					: "对话：新会话（发送后自动创建并保留上下文）",
-			);
-			messagesEl.empty();
-			if (!thread || thread.messages.length === 0) {
-				messagesEl.createDiv({
-					cls: "ai-notebook-empty",
-					text:
-						this.chatMode === "feature"
-							? "改功能对话上下文会出现在这里。可打开「历史」继续旧会话。"
-							: "助手对话上下文会出现在这里。支持多轮；「历史」可管理记录。",
-				});
-			} else {
-				for (const m of thread.messages) {
-					const bubble = messagesEl.createDiv({
-						cls:
-							m.role === "user"
-								? "ai-notebook-chat-bubble user"
-								: m.role === "assistant"
-									? "ai-notebook-chat-bubble assistant"
-									: "ai-notebook-chat-bubble system",
-					});
-					bubble.createDiv({
-						cls: "ai-notebook-chat-bubble-role",
-						text:
-							m.role === "user"
-								? "你"
-								: m.role === "assistant"
-									? "AI"
-									: "系统",
-					});
-					bubble.createDiv({
-						cls: "ai-notebook-chat-bubble-body",
-						text: m.content,
-					});
-				}
-				messagesEl.scrollTop = messagesEl.scrollHeight;
-			}
-		};
-
-		const setMode = (mode: "assistant" | "feature") => {
-			this.chatMode = mode;
-			assistantBtn.toggleClass("mod-cta", mode === "assistant");
-			featureBtn.toggleClass("mod-cta", mode === "feature");
-			hint.setText(
-				mode === "assistant"
-					? "助手模式：多轮上下文会带给模型。需配置 Provider。"
-					: "改功能模式：多轮上下文仅作参考；应用变更仍需 Diff 确认。",
-			);
-			ta.placeholder =
-				mode === "feature"
-					? this.blueprint?.ui.featureEditPrompt ??
-						"描述你想如何改这个记录本的功能…"
-					: this.blueprint?.ui.homePrompt ?? "向助手提问…";
-			paintMessages();
-		};
-
-		sendBtn.addEventListener("click", () => {
-			const text = ta.value.trim();
-			if (!text || this.chatBusy) return;
-			void this.handleChatSend(text).then(() => {
-				ta.value = "";
-				paintMessages();
+		// Floating chat — remount preserves expand via chatFloatWantOpen
+		const wasOpen = this.chatFloat
+			? !this.chatFloat.isCollapsed()
+			: this.chatFloatWantOpen;
+		this.chatFloatWantOpen = wasOpen;
+		this.chatFloat?.destroy();
+		this.chatFloat = new ChatFloatPanel(el, {
+				getChatMode: () => this.chatMode,
+				setChatMode: (mode) => {
+					this.chatMode = mode;
+					this.chatFloat?.paint();
+				},
+				getFollowMode: () => this.sendFollowMode,
+				setFollowMode: (m) => {
+					this.sendFollowMode = m;
+				},
+				getAssistantThread: () => this.assistantThread,
+				getFeatureThread: () => this.featureThread,
+				getPendingFiles: () => this.pendingChatFiles,
+				setPendingFiles: (files) => {
+					this.pendingChatFiles = files;
+				},
+				getBusy: () => this.chatBusy,
+				getThinking: () => this.chatThinking,
+				getQueueLength: () => this.sendQueue.length,
+				getPlaceholder: (mode) =>
+					mode === "feature"
+						? this.blueprint?.ui.featureEditPrompt ??
+							"描述你想如何改这个记录本的功能…"
+						: this.blueprint?.ui.homePrompt ?? "向助手提问…",
+				getNotebookLabel: () => this.meta?.name ?? "未选择记录本",
+				getItemLabel: () =>
+					this.activeItem?.frontmatter.title?.trim() ||
+					(this.activeItem
+						? this.activeItem.frontmatter.item_id.slice(0, 8)
+						: "未选中条目"),
+				onPickNotebook: () => {
+					void new ChatPickNotebookModal(
+						this.app,
+						this.plugin,
+						(meta) => {
+							void this.plugin.openNotebook(meta.notebook_id);
+						},
+					).openAndLoad();
+				},
+				onPickItem: () => {
+					if (!this.meta) {
+						new Notice("请先选择记录本");
+						return;
+					}
+					if (this.items.length === 0) {
+						new Notice("当前记录本没有条目");
+						return;
+					}
+					new ChatPickItemModal(this.app, this.items, (item) => {
+						void this.selectItem(item);
+					}).open();
+				},
+				onPickFiles: async () => {
+						await this.pickChatAttachments();
+					},
+					onIngestFiles: async (files) => {
+						await this.ingestBrowserFiles(files);
+					},
+				onOpenHistory: () => {
+					this.openChatHistoryModal();
+				},
+				onNewChat: () => {
+					if (this.chatMode === "feature") this.featureThread = null;
+					else {
+						this.assistantThread = null;
+						this.sessionChatFiles = [];
+						this.forceNewAssistantThread = true;
+					}
+					new Notice("已开始新对话");
+					this.chatFloat?.paint();
+				},
+				onSubmit: (text, files) => {
+					void this.enqueueOrSend(text, files);
+				},
+				onExpanded: () => {
+					this.chatFloatWantOpen = true;
+				},
 			});
-		});
-		ta.addEventListener("keydown", (e) => {
-			if (e.key === "Enter" && !e.shiftKey) {
-				e.preventDefault();
-				sendBtn.click();
-			}
-		});
-		assistantBtn.addEventListener("click", () => setMode("assistant"));
-		featureBtn.addEventListener("click", () => setMode("feature"));
-		historyBtn.addEventListener("click", () => {
+		this.chatFloat.mount({ startCollapsed: !this.chatFloatWantOpen });
+		}
+
+		private openChatHistoryModal(): void {
 			if (!this.meta) return;
+			const itemId =
+				this.chatMode === "assistant"
+					? (this.activeItem?.frontmatter.item_id ?? null)
+					: null;
+			const itemTitle =
+				this.chatMode === "assistant"
+					? (this.activeItem?.frontmatter.title ?? null)
+					: null;
 			new ChatHistoryModal(
 				this.app,
 				this.plugin,
@@ -316,26 +362,150 @@ export class NotebookView extends ItemView {
 				this.chatMode,
 				{
 					onPick: (t) => {
-						if (this.chatMode === "feature") this.featureThread = t;
-						else this.assistantThread = t;
-						paintMessages();
+						if (this.chatMode === "feature") {
+							this.featureThread = t;
+						} else {
+							this.forceNewAssistantThread = false;
+							this.assistantThread = t;
+							if (t.itemId) {
+								const found = this.items.find(
+									(it) => it.frontmatter.item_id === t.itemId,
+								);
+								if (found) void this.selectItem(found, false);
+							}
+						}
+						this.chatFloat?.paint();
 					},
 					onNew: () => {
-						if (this.chatMode === "feature") this.featureThread = null;
-						else this.assistantThread = null;
-						paintMessages();
-					},
+							if (this.chatMode === "feature") this.featureThread = null;
+							else {
+								this.assistantThread = null;
+								this.sessionChatFiles = [];
+								this.forceNewAssistantThread = true;
+							}
+							this.chatFloat?.paint();
+						},
+					onSwitchItem:
+						this.chatMode === "assistant"
+							? () => {
+									if (!this.meta || this.items.length === 0) {
+										new Notice("没有可选条目");
+										return;
+									}
+									new ChatPickItemModal(
+										this.app,
+										this.items,
+										(item) => {
+											void this.selectItem(item).then(() =>
+												this.openChatHistoryModal(),
+											);
+										},
+									).open();
+								}
+							: undefined,
 				},
+				{ itemId, itemTitle },
 			).open();
-		});
-		newChatBtn.addEventListener("click", () => {
-			if (this.chatMode === "feature") this.featureThread = null;
-			else this.assistantThread = null;
-			paintMessages();
-			new Notice("已开始新对话");
-		});
-		setMode(this.chatMode);
-	}
+		}
+
+		private async selectItem(
+			item: NotebookItem,
+			resetAssistantThread = true,
+		): Promise<void> {
+			if (this.chatFloat && !this.chatFloat.isCollapsed()) {
+				this.chatFloatWantOpen = true;
+			}
+			this.activeItem = item;
+			this.leftTab = "items";
+			this.ensureSessionFilesScope();
+			if (resetAssistantThread) {
+				// Switching items: drop "new chat" flag and restore that item's latest
+				this.forceNewAssistantThread = false;
+				await this.restoreLatestAssistantThread();
+			}
+			this.render();
+			if (this.chatFloatWantOpen && this.chatFloat?.isCollapsed()) {
+				this.chatFloat.setCollapsed(false);
+			}
+			this.chatFloat?.paint();
+		}
+
+		private sessionFilesKey(): string {
+			const nb = this.meta?.notebook_id ?? "";
+			const it = this.activeItem?.frontmatter.item_id ?? "__none__";
+			return `${nb}::${it}`;
+		}
+
+		private ensureSessionFilesScope(): void {
+			const key = this.sessionFilesKey();
+			if (this.sessionFilesItemKey !== key) {
+				this.sessionFilesItemKey = key;
+				this.sessionChatFiles = [];
+			}
+		}
+
+		private rememberSessionFiles(files: PendingChatFile[]): void {
+			this.ensureSessionFilesScope();
+			if (!files.length) return;
+			const byId = new Map(this.sessionChatFiles.map((f) => [f.id, f]));
+			for (const f of files) byId.set(f.id, f);
+			this.sessionChatFiles = [...byId.values()];
+		}
+
+		/** Model / UI: only this turn's files (never mix previous uploads). */
+		private filesForThisTurn(sendFiles: PendingChatFile[]): PendingChatFile[] {
+			return [...sendFiles];
+		}
+
+		/**
+		 * embed_in_body lookup: this-turn first, then session cache (same item).
+		 * Index "0" always means first of THIS turn when present.
+		 */
+		private filesForEmbedActions(
+			sendFiles: PendingChatFile[],
+		): PendingChatFile[] {
+			this.ensureSessionFilesScope();
+			const ordered: PendingChatFile[] = [];
+			const seen = new Set<string>();
+			for (const f of sendFiles) {
+				if (seen.has(f.id)) continue;
+				seen.add(f.id);
+				ordered.push(f);
+			}
+			for (const f of this.sessionChatFiles) {
+				if (seen.has(f.id)) continue;
+				seen.add(f.id);
+				ordered.push(f);
+			}
+			return ordered;
+		}
+
+		private dropSessionFiles(ids: string[]): void {
+			if (!ids.length) return;
+			const drop = new Set(ids);
+			this.sessionChatFiles = this.sessionChatFiles.filter((f) => !drop.has(f.id));
+		}
+
+		/** Load most recent assistant thread for current item, or null. */
+		private async restoreLatestAssistantThread(): Promise<void> {
+			if (this.forceNewAssistantThread) {
+				this.assistantThread = null;
+				return;
+			}
+			this.assistantThread = null;
+			if (!this.meta) return;
+			const itemId = this.activeItem?.frontmatter.item_id ?? null;
+			try {
+				const list = await this.plugin.chatHistory.list(
+					this.meta.notebook_id,
+					"assistant",
+					itemId,
+				);
+				this.assistantThread = list[0] ?? null;
+			} catch {
+				this.assistantThread = null;
+			}
+		}
 
 
 	async voiceCapturePublic(): Promise<void> {
@@ -657,7 +827,7 @@ export class NotebookView extends ItemView {
 			"加一个状态字段，选项 to-read / reading / done",
 		);
 		if (text == null || !text.trim()) return;
-		await this.handleChatSend(text.trim());
+		await this.enqueueOrSend(text.trim(), []);
 	}
 
 
@@ -672,28 +842,146 @@ export class NotebookView extends ItemView {
 			}
 			return this.featureThread;
 		}
+		const itemId = this.activeItem?.frontmatter.item_id ?? null;
+		const itemTitle = this.activeItem?.frontmatter.title ?? null;
+		if (
+			this.assistantThread &&
+			(this.assistantThread.itemId ?? null) !== itemId
+		) {
+			this.assistantThread = null;
+		}
+		// 「新对话」: never re-attach latest history; always create once
+		if (this.forceNewAssistantThread) {
+			if (!this.assistantThread) {
+				this.assistantThread = await this.plugin.chatHistory.create(
+					this.meta.notebook_id,
+					"assistant",
+					{ itemId, itemTitle },
+				);
+			}
+			this.forceNewAssistantThread = false;
+			return this.assistantThread;
+		}
+		if (!this.assistantThread) {
+			try {
+				const list = await this.plugin.chatHistory.list(
+					this.meta.notebook_id,
+					"assistant",
+					itemId,
+				);
+				if (list[0]) {
+					this.assistantThread = list[0];
+				}
+			} catch {
+				/* ignore */
+			}
+		}
 		if (!this.assistantThread) {
 			this.assistantThread = await this.plugin.chatHistory.create(
 				this.meta.notebook_id,
 				"assistant",
+				{ itemId, itemTitle },
 			);
 		}
 		return this.assistantThread;
 	}
 
-	private async handleChatSend(text: string): Promise<void> {
+	/**
+	 * Instant UX: message already cleared in UI. If busy → queue or guide.
+	 * Otherwise start processing immediately (thinking indicator).
+	 */
+	private async enqueueOrSend(
+		text: string,
+		files: PendingChatFile[],
+	): Promise<void> {
+		const mode = this.chatMode;
+		if (this.chatBusy) {
+			if (this.sendFollowMode === "guide" && mode === "assistant") {
+				this.guideBuffer = [...this.guideBuffer, text];
+				// show guide as a system-ish user note in history quickly
+				try {
+					const thread = await this.ensureThread();
+					await this.plugin.chatHistory.append(
+						thread.id,
+						"user",
+						`【引导补充】${text}`,
+					);
+					this.assistantThread =
+						(await this.plugin.chatHistory.get(thread.id)) ?? thread;
+				} catch {
+					/* ignore */
+				}
+				new Notice("已作为引导附加到当前请求");
+				this.chatFloat?.paint();
+				return;
+			}
+			this.sendQueue = [
+				...this.sendQueue,
+				{
+					id: createId(),
+					mode,
+					text,
+					files,
+					follow: "queue",
+				},
+			];
+			new Notice(`已加入队列（第 ${this.sendQueue.length} 条）`);
+			this.chatFloat?.paint();
+			return;
+		}
+		await this.processSend(mode, text, files);
+	}
+
+	private async processSend(
+		mode: "assistant" | "feature",
+		text: string,
+		files: PendingChatFile[],
+	): Promise<void> {
 		if (this.chatBusy) return;
+		this.chatMode = mode;
 		this.chatBusy = true;
+		this.chatThinking = true;
+		this.chatFloatWantOpen = true;
+		if (this.chatFloat?.isCollapsed()) this.chatFloat.setCollapsed(false);
+		this.chatFloat?.paint();
 		try {
-			if (this.chatMode === "feature") {
+			if (mode === "feature") {
 				await this.runFeatureEdit(text);
 			} else {
-				await this.runAssistantChat(text);
+				await this.runAssistantChat(text, files);
 			}
 		} finally {
+			this.chatThinking = false;
 			this.chatBusy = false;
-			this.render();
+			if (this.meta) {
+				try {
+					this.items = await this.plugin.items.listItems(this.meta);
+					if (this.activeItem) {
+						const fresh = this.items.find(
+							(it) =>
+								it.frontmatter.item_id ===
+								this.activeItem!.frontmatter.item_id,
+						);
+						if (fresh) this.activeItem = fresh;
+					}
+				} catch {
+					/* ignore */
+				}
+				// Refresh main UI without dropping chat float size/session mid-flight:
+				// full render remounts float (always collapsed) — do it after paint.
+				this.render();
+			}
+			this.chatFloat?.paint();
+			await this.drainSendQueue();
 		}
+	}
+
+	private async drainSendQueue(): Promise<void> {
+		if (this.chatBusy || this.sendQueue.length === 0) return;
+		const [next, ...rest] = this.sendQueue;
+		this.sendQueue = rest;
+		if (!next) return;
+		await this.processSend(next.mode, next.text, next.files);
 	}
 
 	private async runFeatureEdit(instruction: string): Promise<void> {
@@ -789,18 +1077,50 @@ export class NotebookView extends ItemView {
 		}
 	}
 
-	private async runAssistantChat(text: string): Promise<void> {
+	private async runAssistantChat(
+		text: string,
+		files: PendingChatFile[],
+	): Promise<void> {
 		if (!this.meta || !this.blueprint) {
 			new Notice("未打开记录本");
 			return;
 		}
 		const thread = await this.ensureThread();
-		await this.plugin.chatHistory.append(thread.id, "user", text);
-		this.assistantThread = (await this.plugin.chatHistory.get(thread.id)) ?? thread;
+		this.rememberSessionFiles(files);
+		// Model sees ONLY this turn — never previous session uploads
+		const pending = this.filesForThisTurn(files);
+		const embedPool = this.filesForEmbedActions(files);
+		const attachNote =
+			pending.length > 0
+				? `\n\n[本轮附件 ${pending.length} 个：${pending.map((f) => f.name).join("、")}]`
+				: "";
+		await this.plugin.chatHistory.append(
+			thread.id,
+			"user",
+			text + attachNote,
+			toChatMessageAttachments(pending),
+		);
+		this.assistantThread =
+			(await this.plugin.chatHistory.get(thread.id)) ?? thread;
+		this.chatFloat?.paint();
 
-		const resolved = this.plugin.resolveAi("worker", this.meta);
-		if (!resolved) {
-			const err = "请先在设置中配置 AI Provider";
+		// absorb any guide lines that arrived after we started
+		const guides = [...this.guideBuffer];
+		this.guideBuffer = [];
+		const guideBlock =
+			guides.length > 0
+				? `\n\n【用户引导补充】\n${guides.map((g, i) => `${i + 1}. ${g}`).join("\n")}`
+				: "";
+
+		const needVision = pending.some((f) => f.kind === "image" && f.dataUrl);
+		const chain = resolveProviderChain(
+			this.plugin.settings,
+			"worker",
+			this.meta,
+			{ vision: needVision },
+		);
+		if (chain.length === 0) {
+			const err = "请先在设置中配置 AI Provider（用途：整理/助手 的顺序链）";
 			await this.plugin.chatHistory.append(thread.id, "assistant", err);
 			this.assistantThread = await this.plugin.chatHistory.get(thread.id);
 			new Notice(err);
@@ -810,45 +1130,272 @@ export class NotebookView extends ItemView {
 		const ctxItem = this.activeItem
 			? JSON.stringify(
 					{
+						item_id: this.activeItem.frontmatter.item_id,
 						title: this.activeItem.frontmatter.title,
 						fields: this.activeItem.frontmatter,
-						body: this.activeItem.body.slice(0, 2000),
+						body: this.activeItem.body.slice(0, 4000),
 					},
 					null,
 					2,
 				)
-			: "(无选中条目)";
+			: "(无选中条目 — update_item / embed_in_body 前请先选中，或 create_item)";
 
 		const system = [
 			this.blueprint.aiBehaviors.systemHints,
-			"你是记录本助手。简洁中文回答。不要输出可执行代码去改系统。",
+			assistantToolSystemAppendix(pending),
 			`记录本: ${this.meta.name}`,
 			`实体字段定义: ${JSON.stringify(this.blueprint.entityTypes)}`,
 			`当前选中条目: ${ctxItem}`,
 		].join("\n");
 
-		const history = this.plugin.chatHistory.toApiMessages(
+		const historyBase = this.plugin.chatHistory.toApiMessages(
 			this.assistantThread!,
 			system,
 			20,
 		);
-		new Notice("助手思考中…");
-		const result = await this.plugin.gateway.chat(
-			resolved.profile,
-			resolved.model,
-			history,
-			{ maxTokens: 1024, temperature: 0.4 },
-		);
+		// inject guide into last user message if any
+		if (guideBlock && historyBase.length) {
+			const last = historyBase[historyBase.length - 1];
+			if (last && last.role === "user" && typeof last.content === "string") {
+				historyBase[historyBase.length - 1] = {
+					...last,
+					content: last.content + guideBlock,
+				};
+			}
+		}
+
+		const messages = this.buildAssistantMessages(historyBase, pending);
+
+		let result: { ok: true; content: string } | { ok: false; error: string } =
+			{ ok: false, error: "无可用模型" };
+		const tried: string[] = [];
+
+		for (const cand of chain) {
+			const label = `${cand.profile.name}/${cand.model}`;
+			tried.push(label);
+			const r = await this.plugin.gateway.chat(
+				cand.profile,
+				cand.model,
+				messages,
+				{ maxTokens: 2048, temperature: 0.35 },
+			);
+			if (r.ok) {
+				result = r;
+				if (tried.length > 1) {
+					new Notice(`已用模型：${label}`);
+				}
+				break;
+			}
+			result = r;
+		}
+
 		if (!result.ok) {
-			const err = `助手失败: ${result.error}`;
+			const err = `助手失败: ${result.error}${tried.length ? `（已试：${tried.join(" → ")}）` : ""}`;
 			await this.plugin.chatHistory.append(thread.id, "assistant", err);
 			this.assistantThread = await this.plugin.chatHistory.get(thread.id);
 			new Notice(err);
 			return;
 		}
-		await this.plugin.chatHistory.append(thread.id, "assistant", result.content);
+
+		const parsed = parseAssistantResponse(result.content);
+		const actions = maybeInferEmbedActions(text, parsed.actions, pending);
+		let reply = parsed.reply || result.content;
+		if (actions.length && /```|embed_in_body|"actions"\s*:/.test(reply)) {
+			const cleaned = reply
+				.replace(/```(?:json)?\s*[\s\S]*?```/gi, "")
+				.replace(/^\s*[\]}]\s*$/gm, "")
+				.trim();
+			if (cleaned) reply = cleaned;
+		}
+
+		if (actions.length > 0) {
+			const needsItem = actions.some(
+				(a) => a.type === "embed_in_body" || a.type === "update_item",
+			);
+			if (needsItem && !this.activeItem) {
+				const warn =
+					"未选中条目，无法写入正文。请先在左侧或对话窗口选择条目。";
+				reply = `${reply}\n\n——\n${warn}`;
+				new Notice(warn);
+			} else {
+				const runner = new AssistantActionRunner(
+					this.plugin.items,
+					this.plugin.cabinet,
+					this.plugin.vaultIo,
+					() => this.plugin.settings,
+				);
+				const apply = await runner.apply(
+					this.meta,
+					this.blueprint,
+					this.activeItem,
+					[...this.items],
+					actions,
+					embedPool,
+				);
+				if (apply.messages.length) {
+					reply = `${reply}\n\n——\n${apply.messages.join("\n")}`;
+				}
+				if (apply.updatedItem) {
+					this.activeItem = apply.updatedItem;
+				}
+				if (apply.createdItem) {
+					this.activeItem = apply.createdItem;
+				}
+				this.items = await this.plugin.items.listItems(this.meta);
+				if (this.activeItem) {
+					const fresh = this.items.find(
+						(it) =>
+							it.frontmatter.item_id ===
+							this.activeItem!.frontmatter.item_id,
+					);
+					if (fresh) this.activeItem = fresh;
+				}
+				const ok = apply.messages.some(
+					(m) =>
+						m.includes("已将") ||
+						m.includes("已更新") ||
+						m.includes("已新建"),
+				);
+				new Notice(
+					ok
+						? "助手已写入笔记"
+						: "助手已回复（部分动作可能失败，见对话摘要）",
+				);
+			}
+		} else {
+			new Notice("助手已回复");
+		}
+
+		await this.plugin.chatHistory.append(thread.id, "assistant", reply);
 		this.assistantThread = await this.plugin.chatHistory.get(thread.id);
-		new Notice("助手已回复（见下方对话区）");
+		this.chatFloat?.paint();
+	}
+
+	/**
+	 * If last user message should include image parts, rebuild messages for gateway.
+	 */
+	private buildAssistantMessages(
+		history: ChatMessage[],
+		pending: PendingChatFile[],
+	): ChatMessage[] {
+		const images = pending.filter((f) => f.kind === "image" && f.dataUrl);
+		const textExtras = pending
+			.filter((f) => f.kind !== "image" || !f.dataUrl)
+			.map((f) => {
+				const head = `【附件 ${f.name} | ${f.kind} | ${f.mime}】`;
+				if (f.textPreview) return `${head}\n${f.textPreview.slice(0, 8000)}`;
+				return `${head}\n（二进制未直接内嵌；说「放进正文」用 embed_in_body，说「收藏柜」用 attach_chat_file）`;
+			});
+
+		if (images.length === 0 && textExtras.length === 0) {
+			return history;
+		}
+
+		const out = history.map((m) => ({ ...m }));
+		// find last user message
+		for (let i = out.length - 1; i >= 0; i--) {
+			const m = out[i]!;
+			if (m.role !== "user") continue;
+			const baseText =
+				typeof m.content === "string"
+					? m.content
+					: m.content
+							.filter((p): p is { type: "text"; text: string } => p.type === "text")
+							.map((p) => p.text)
+							.join("\n");
+			const parts: ChatContentPart[] = [
+				{
+					type: "text",
+					text: [baseText, ...textExtras].filter(Boolean).join("\n\n"),
+				},
+			];
+			for (const img of images) {
+				parts.push({
+					type: "image_url",
+					image_url: { url: img.dataUrl!, detail: "auto" },
+				});
+			}
+			out[i] = { role: "user", content: parts };
+			break;
+		}
+		return out;
+	}
+
+	private async pickChatAttachments(): Promise<void> {
+		const files = await pickLocalFiles({
+			multiple: true,
+			accept: "image/*,video/*,audio/*,.pdf,.txt,.md,.json,.csv,.doc,.docx",
+		});
+		if (!files.length) return;
+		await this.ingestBrowserFiles(files);
+	}
+
+	/** Button / drag / paste entry: read File[], stage chips, persist to vault. */
+	private async ingestBrowserFiles(files: File[]): Promise<void> {
+		if (!files.length) return;
+		if (!this.meta) {
+			new Notice("请先打开记录本再上传");
+			return;
+		}
+		const MAX_IMAGE_INLINE = 4 * 1024 * 1024;
+		const MAX_TEXT_READ = 512 * 1024;
+		const added: PendingChatFile[] = [];
+
+		for (const file of files) {
+			const data = await file.arrayBuffer();
+			const mime = file.type || guessMimeFromName(file.name);
+			const kind = classifyMime(mime, file.name);
+			const id = createId();
+			let dataUrl: string | undefined;
+			let textPreview: string | undefined;
+
+			if (kind === "image" && data.byteLength <= MAX_IMAGE_INLINE) {
+				dataUrl = await arrayBufferToDataUrl(data, mime || "image/png");
+			}
+			if (
+				kind === "text" ||
+				/\.(txt|md|json|csv|log|xml|html?)$/i.test(file.name)
+			) {
+				if (data.byteLength <= MAX_TEXT_READ) {
+					textPreview = new TextDecoder("utf-8", {
+						fatal: false,
+					}).decode(data);
+				}
+			}
+
+			let pending: PendingChatFile = {
+				id,
+				name: file.name || `paste-${id.slice(0, 6)}.png`,
+				mime: mime || "application/octet-stream",
+				size: data.byteLength,
+				data,
+				dataUrl,
+				kind,
+				textPreview,
+			};
+			try {
+				pending = await persistChatUpload(
+					this.plugin.vaultIo,
+					this.plugin.settings,
+					this.meta.notebook_id,
+					this.activeItem?.frontmatter.item_id ?? null,
+					pending,
+				);
+			} catch (e) {
+				console.warn("[ai-notebook] persist chat upload", e);
+			}
+			added.push(pending);
+		}
+
+		this.pendingChatFiles = [...this.pendingChatFiles, ...added];
+		this.rememberSessionFiles(added);
+		this.chatFloat?.paint();
+		new Notice(`已添加 ${added.length} 个附件（默认仅参考；已存入对话附件目录）`);
+	}
+
+	/** Clipboard image paste (e.g. screenshot). */
+	async ingestClipboardImage(file: File): Promise<void> {
+		await this.ingestBrowserFiles([file]);
 	}
 
 	private renderDetail(pane: HTMLElement): void {
@@ -976,7 +1523,37 @@ export class NotebookView extends ItemView {
 		if (field.type === "markdown") {
 			const ta = wrap.createEl("textarea");
 			ta.value = value != null ? String(value) : "";
+			ta.rows = 8;
 			ta.addEventListener("blur", () => onCommit(ta.value));
+			const preview = wrap.createDiv({
+				cls: "ai-notebook-body-media-preview",
+			});
+			const paintPreview = (src: string) => {
+				preview.empty();
+				const embeds = extractMediaPaths(src);
+				if (!embeds.length) return;
+				for (const emb of embeds) {
+					const block = preview.createDiv({
+						cls: "ai-notebook-media-block",
+					});
+					if (emb.kind === "image") {
+						const img = block.createEl("img");
+						img.src = this.vaultResourceUrl(emb.path);
+						img.alt = emb.path;
+					} else if (emb.kind === "video") {
+						const v = block.createEl("video");
+						v.src = this.vaultResourceUrl(emb.path);
+						v.controls = true;
+						(v as HTMLVideoElement).playsInline = true;
+					} else if (emb.kind === "audio") {
+						const a = block.createEl("audio");
+						a.src = this.vaultResourceUrl(emb.path);
+						a.controls = true;
+					}
+				}
+			};
+			paintPreview(ta.value);
+			ta.addEventListener("input", () => paintPreview(ta.value));
 			return;
 		}
 
@@ -1157,8 +1734,7 @@ export class NotebookView extends ItemView {
 				text: [timeLabel, extras].filter(Boolean).join(" · "),
 			});
 			row.addEventListener("click", () => {
-				this.activeItem = item;
-				this.render();
+				void this.selectItem(item);
 			});
 		}
 	}
@@ -1191,8 +1767,7 @@ export class NotebookView extends ItemView {
 				tr.createEl("td", { text: formatCell(item.frontmatter[f.id]) });
 			}
 			tr.addEventListener("click", () => {
-				this.activeItem = item;
-				this.render();
+				void this.selectItem(item);
 			});
 		}
 	}
@@ -1233,8 +1808,7 @@ export class NotebookView extends ItemView {
 					text: formatItemTime(item),
 				});
 				card.addEventListener("click", () => {
-					this.activeItem = item;
-					this.render();
+					void this.selectItem(item);
 				});
 			}
 		}
@@ -1609,7 +2183,24 @@ export class NotebookView extends ItemView {
 			new Notice(`提交失败: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
+
+	private vaultResourceUrl(vaultPath: string): string {
+		const p = vaultPath.replace(/\\/g, "/");
+		try {
+			const adapter = this.app.vault.adapter as {
+				getResourcePath?: (path: string) => string;
+			};
+			if (typeof adapter.getResourcePath === "function") {
+				return adapter.getResourcePath(p);
+			}
+		} catch {
+			/* ignore */
+		}
+		return p;
+	}
 }
+
+
 
 function formatItemTime(item: NotebookItem): string {
 	const raw =
@@ -1625,3 +2216,98 @@ function formatCell(value: unknown): string {
 	if (Array.isArray(value)) return value.join(", ");
 	return String(value);
 }
+
+function classifyMime(
+	mime: string,
+	name: string,
+): PendingChatFile["kind"] {
+	const m = (mime || "").toLowerCase();
+	const n = name.toLowerCase();
+	if (m.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(n)) {
+		return "image";
+	}
+	if (m.startsWith("video/") || /\.(mp4|mov|webm|mkv|avi)$/i.test(n)) {
+		return "video";
+	}
+	if (m.startsWith("audio/") || /\.(mp3|wav|m4a|ogg|flac)$/i.test(n)) {
+		return "audio";
+	}
+	if (
+		m.startsWith("text/") ||
+		/\.(txt|md|json|csv|log|xml|html?)$/i.test(n)
+	) {
+		return "text";
+	}
+	return "other";
+}
+
+function guessMimeFromName(name: string): string {
+	const n = name.toLowerCase();
+	if (/\.png$/i.test(n)) return "image/png";
+	if (/\.jpe?g$/i.test(n)) return "image/jpeg";
+	if (/\.gif$/i.test(n)) return "image/gif";
+	if (/\.webp$/i.test(n)) return "image/webp";
+	if (/\.mp4$/i.test(n)) return "video/mp4";
+	if (/\.webm$/i.test(n)) return "video/webm";
+	if (/\.mp3$/i.test(n)) return "audio/mpeg";
+	if (/\.wav$/i.test(n)) return "audio/wav";
+	if (/\.pdf$/i.test(n)) return "application/pdf";
+	if (/\.json$/i.test(n)) return "application/json";
+	if (/\.md$/i.test(n)) return "text/markdown";
+	if (/\.txt$/i.test(n)) return "text/plain";
+	return "application/octet-stream";
+}
+
+function arrayBufferToDataUrl(
+	data: ArrayBuffer,
+	mime: string,
+): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const blob = new Blob([data], { type: mime });
+		const reader = new FileReader();
+		reader.onload = () => resolve(String(reader.result ?? ""));
+		reader.onerror = () =>
+			reject(reader.error ?? new Error("read dataUrl failed"));
+		reader.readAsDataURL(blob);
+	});
+}
+
+function extractMediaPaths(
+	src: string,
+): Array<{ path: string; kind: "image" | "video" | "audio" | "other" }> {
+	const out: Array<{
+		path: string;
+		kind: "image" | "video" | "audio" | "other";
+	}> = [];
+	const seen = new Set<string>();
+	const push = (path: string) => {
+		const p = path.trim().replace(/\\/g, "/");
+		if (!p || seen.has(p)) return;
+		seen.add(p);
+		out.push({ path: p, kind: mediaKindFromPath(p) });
+	};
+	// ![[path]]
+	for (const m of src.matchAll(/!\[\[([^\]]+)\]\]/g)) {
+		push(m[1]!.split("|")[0]!.trim());
+	}
+	// ![alt](path)
+	for (const m of src.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)) {
+		push(m[1]!.trim());
+	}
+	// <video src="..."> / <audio src="...">
+	for (const m of src.matchAll(/<(?:video|audio)[^>]+src=["']([^"']+)["']/gi)) {
+		push(m[1]!.trim());
+	}
+	return out;
+}
+
+function mediaKindFromPath(
+	path: string,
+): "image" | "video" | "audio" | "other" {
+	const n = path.toLowerCase();
+	if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(n)) return "image";
+	if (/\.(mp4|webm|mov|mkv|avi)$/i.test(n)) return "video";
+	if (/\.(mp3|wav|m4a|ogg|flac)$/i.test(n)) return "audio";
+	return "other";
+}
+

@@ -13,6 +13,8 @@ import {
 } from "../domain/providerImport";
 import { AiGateway } from "../infra/aiGateway";
 import { renderProviderSection } from "./providerSettings";
+import { chatUploadsRoot } from "../infra/paths";
+import { pickAnyDirectory } from "../infra/folderPick";
 
 export class AiNotebookSettingTab extends PluginSettingTab {
 	plugin: AiNotebookPlugin;
@@ -66,6 +68,98 @@ export class AiNotebookSettingTab extends PluginSettingTab {
 			);
 
 		
+		
+		const effectiveChatRoot = chatUploadsRoot(this.plugin.settings);
+		const chatUploadSetting = new Setting(containerEl)
+			.setName("对话上传保存位置")
+			.setDesc(
+				"助手上传/拖拽/粘贴文件的存档目录。可点「选择文件夹…」选电脑任意盘符路径；也可库内相对路径。修改不移动已有文件。",
+			);
+		const pathLabel = chatUploadSetting.controlEl.createDiv({
+			cls: "ai-notebook-path-display",
+			text: effectiveChatRoot || "（默认）",
+		});
+		pathLabel.title = effectiveChatRoot;
+		chatUploadSetting
+			.addButton((b) =>
+				b.setButtonText("选择文件夹…").setCta().onClick(async () => {
+					const picked = await pickAnyDirectory({
+						title: "选择对话上传保存文件夹",
+						defaultPath:
+							this.plugin.settings.paths.chatUploadsRoot || undefined,
+					});
+					if (!picked) return;
+					const normalized = picked.replace(/\\/g, "/");
+					this.plugin.settings = {
+						...this.plugin.settings,
+						paths: {
+							...this.plugin.settings.paths,
+							chatUploadsRoot: normalized,
+						},
+					};
+					await this.plugin.saveSettings();
+					new Notice(`已设置：${normalized}`);
+					this.display();
+				}),
+			)
+			.addButton((b) =>
+				b.setButtonText("恢复默认").onClick(async () => {
+					this.plugin.settings = {
+						...this.plugin.settings,
+						paths: {
+							...this.plugin.settings.paths,
+							chatUploadsRoot: null,
+						},
+					};
+					await this.plugin.saveSettings();
+					new Notice("对话上传路径已恢复默认");
+					this.display();
+				}),
+			);
+
+		const retention = this.plugin.settings.chatUploadRetentionDays;
+		const isPermanent = retention == null;
+		new Setting(containerEl)
+			.setName("对话附件保留")
+			.setDesc("打开=永久保留（默认）。关闭后可自定义保留天数。")
+			.addToggle((tg) => {
+				tg.setValue(isPermanent);
+				tg.onChange(async (on) => {
+					this.plugin.settings = {
+						...this.plugin.settings,
+						chatUploadRetentionDays: on ? null : 30,
+					};
+					await this.plugin.saveSettings();
+					this.display();
+				});
+			});
+		containerEl.createDiv({
+			cls: "setting-item-description",
+			text: isPermanent
+				? "当前策略：永久保留历史上传文件"
+				: `当前策略：保留 ${retention} 天（自动清理可后续扩展）`,
+		});
+		if (!isPermanent) {
+			new Setting(containerEl)
+				.setName("保留天数")
+				.setDesc("输入正整数，例如 7 / 30 / 90")
+				.addText((tx) => {
+					tx.inputEl.type = "number";
+					tx.inputEl.min = "1";
+					tx.inputEl.step = "1";
+					tx.setValue(String(retention ?? 30));
+					tx.onChange(async (v) => {
+						const n = parseInt(v.trim(), 10);
+						if (!Number.isFinite(n) || n <= 0) return;
+						this.plugin.settings = {
+							...this.plugin.settings,
+							chatUploadRetentionDays: Math.floor(n),
+						};
+						await this.plugin.saveSettings();
+					});
+				});
+		}
+
 		new Setting(containerEl)
 			.setName("手机收件箱目录")
 			.setDesc("手机写入杂乱信息的 vault 文件夹，默认 AI Inbox")

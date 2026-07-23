@@ -5,10 +5,15 @@ export function joinPath(...parts: string[]): string {
 		.map((p, i) => {
 			let s = p.replace(/\\/g, "/");
 			if (i > 0) s = s.replace(/^\/+/, "");
-			s = s.replace(/\/+$/, "");
+			// keep Windows drive "C:/" intact on first segment
+			if (i === 0 && /^[a-zA-Z]:\//.test(s)) {
+				s = s.replace(/\/+$/, "") || s.slice(0, 3);
+			} else {
+				s = s.replace(/\/+$/, "");
+			}
 			return s;
 		})
-		.filter(Boolean)
+		.filter((s, i) => Boolean(s) || (i === 0 && s === ""))
 		.join("/");
 }
 
@@ -82,6 +87,33 @@ export function attachmentsDir(
 		settings.paths.attachmentsRoot.replace(/\\/g, "/").replace(/\/+$/, ""),
 		notebookId,
 	);
+}
+
+/**
+ * Root for assistant chat uploads (history / re-download).
+ * May be vault-relative OR absolute (user picked any disk folder).
+ * Default: `{attachmentsRoot}/chat-uploads`
+ */
+export function chatUploadsRoot(settings: AiNotebookSettings): string {
+	const custom = settings.paths.chatUploadsRoot?.trim();
+	if (custom) {
+		return custom.replace(/\\/g, "/").replace(/\/+$/, "");
+	}
+	const att = settings.paths.attachmentsRoot
+		.replace(/\\/g, "/")
+		.replace(/\/+$/, "");
+	return joinPath(att, "chat-uploads");
+}
+
+/** Per notebook (+ optional item) folder for chat-upload archive. */
+export function chatUploadsDir(
+	settings: AiNotebookSettings,
+	notebookId: string,
+	itemId?: string | null,
+): string {
+	const root = chatUploadsRoot(settings);
+	if (itemId) return joinPath(root, notebookId, itemId);
+	return joinPath(root, notebookId);
 }
 
 export function inboxRoot(settings: AiNotebookSettings): string {

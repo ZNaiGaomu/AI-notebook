@@ -4,6 +4,7 @@ import type {
 	ProviderProfile,
 	PurposeRouting,
 } from "./types";
+import { normalizeRouteChain } from "./purposeRouting";
 
 /**
  * Normalize one provider from import JSON (various shapes).
@@ -276,18 +277,21 @@ function mergeRouting(
 	patch: PurposeRouting,
 ): PurposeRouting {
 	return {
-		planner: {
-			providerId: patch.planner?.providerId ?? base.planner.providerId,
-			model: patch.planner?.model ?? base.planner.model,
-		},
-		worker: {
-			providerId: patch.worker?.providerId ?? base.worker.providerId,
-			model: patch.worker?.model ?? base.worker.model,
-		},
-		voice: {
-			providerId: patch.voice?.providerId ?? base.voice.providerId,
-			model: patch.voice?.model ?? base.voice.model,
-		},
+		planner: normalizeRouteChain(
+			Array.isArray(patch.planner) && patch.planner.length
+				? patch.planner
+				: base.planner,
+		),
+		worker: normalizeRouteChain(
+			Array.isArray(patch.worker) && patch.worker.length
+				? patch.worker
+				: base.worker,
+		),
+		voice: normalizeRouteChain(
+			Array.isArray(patch.voice) && patch.voice.length
+				? patch.voice
+				: base.voice,
+		),
 	};
 }
 

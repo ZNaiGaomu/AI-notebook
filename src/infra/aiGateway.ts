@@ -6,7 +6,11 @@ export type ChatInputAudioPart = {
 	type: "input_audio";
 	input_audio: { data: string; format: "wav" | "mp3" };
 };
-export type ChatContentPart = ChatTextPart | ChatInputAudioPart;
+export type ChatImageUrlPart = {
+	type: "image_url";
+	image_url: { url: string; detail?: "auto" | "low" | "high" };
+};
+export type ChatContentPart = ChatTextPart | ChatInputAudioPart | ChatImageUrlPart;
 
 export type ChatMessage = {
 	role: "system" | "user" | "assistant";
