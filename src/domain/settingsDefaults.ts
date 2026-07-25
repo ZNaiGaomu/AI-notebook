@@ -70,6 +70,7 @@ export function createDefaultSettings(): AiNotebookSettings {
 			preferredPluginVersion: null,
 			userNotes: [],
 			sources: [],
+			appliedPackage: null,
 		},
 	};
 }
@@ -235,9 +236,39 @@ function normalizePluginHistoryField(
 					: null,
 			userNotes: notes,
 			sources,
+			appliedPackage: normalizeAppliedPackage(
+				(raw as { appliedPackage?: unknown }).appliedPackage,
+			),
 		};
 }
 
+
+
+function normalizeAppliedPackage(
+	raw: unknown,
+): AiNotebookSettings["pluginHistory"]["appliedPackage"] {
+	if (!raw || typeof raw !== "object") return null;
+	const o = raw as Record<string, unknown>;
+	const version = typeof o.version === "string" ? o.version.replace(/^v/i, "") : "";
+	if (!version) return null;
+	const sourceId =
+		typeof o.sourceId === "string"
+			? o.sourceId
+			: o.sourceId === null
+				? null
+				: null;
+	return {
+		version,
+		sourceId,
+		sourceName:
+			typeof o.sourceName === "string"
+				? o.sourceName
+				: sourceId
+					? "GitHub 来源"
+					: "本地备份",
+		at: typeof o.at === "string" ? o.at : "",
+	};
+}
 
 function normalizeVersionSource(
 	raw: unknown,
@@ -248,6 +279,9 @@ function normalizeVersionSource(
 				.filter((r) => r && typeof r === "object")
 				.map((r) => {
 					const x = r as Record<string, unknown>;
+					const ch = x.fetchChannel;
+					const fetchChannel: "release" | "tags" | "code" | undefined =
+						ch === "release" || ch === "tags" || ch === "code" ? ch : undefined;
 					return {
 						version:
 							typeof x.version === "string" ? x.version.replace(/^v/i, "") : "",
@@ -257,6 +291,11 @@ function normalizeVersionSource(
 						body: typeof x.body === "string" ? x.body : "",
 						downloadUrl: typeof x.downloadUrl === "string" ? x.downloadUrl : "",
 						htmlUrl: typeof x.htmlUrl === "string" ? x.htmlUrl : "",
+						fetchChannel,
+						fetchChannelLabel:
+							typeof x.fetchChannelLabel === "string"
+								? x.fetchChannelLabel
+								: undefined,
 					};
 				})
 				.filter((r) => r.version && r.downloadUrl)

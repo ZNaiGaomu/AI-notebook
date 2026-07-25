@@ -29,6 +29,8 @@ export type PluginHistoryState = {
 	userNotes: PluginUserNote[];
 	/** GitHub package sources — full type lives on AiNotebookSettings.pluginHistory */
 	sources: AiNotebookSettings["pluginHistory"]["sources"];
+	/** Last package successfully applied from history UI */
+	appliedPackage: AiNotebookSettings["pluginHistory"]["appliedPackage"];
 };
 
 export function defaultPluginHistory(): PluginHistoryState {
@@ -37,6 +39,7 @@ export function defaultPluginHistory(): PluginHistoryState {
 		preferredPluginVersion: null,
 		userNotes: [],
 		sources: [],
+		appliedPackage: null,
 	};
 }
 
@@ -78,6 +81,10 @@ export function normalizePluginHistory(raw: unknown): PluginHistoryState {
 				: null,
 		userNotes: notes,
 			sources: Array.isArray(r.sources) ? r.sources : [],
+			appliedPackage:
+				r.appliedPackage && typeof r.appliedPackage === "object"
+					? (r.appliedPackage as PluginHistoryState["appliedPackage"])
+					: null,
 	};
 }
 
@@ -99,6 +106,7 @@ export function syncPluginHistoryOnLoad(
 	const latest = latestPluginCapability();
 	const nextHist: PluginHistoryState = {
 		...hist,
+			appliedPackage: hist.appliedPackage ?? null,
 		sources: hist.sources ?? [],
 		lastSeenCapabilityId: latest?.id ?? lastId,
 		// first install: mark preferred as current package if empty
@@ -126,7 +134,7 @@ export function syncPluginHistoryOnLoad(
 	return {
 		settings: {
 			...settings,
-			pluginHistory: { ...nextHist, userNotes, sources: nextHist.sources ?? [] },
+			pluginHistory: { ...nextHist, userNotes, sources: nextHist.sources ?? [], appliedPackage: nextHist.appliedPackage ?? null },
 		},
 		newCaps,
 	};

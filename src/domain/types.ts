@@ -233,7 +233,10 @@ export type VoiceFeatureSettings = {
 export const DEFAULT_VOICE_POLISH_PROMPT =
 	"请将下面的语音转写原文润色为通顺、分段清晰的中文笔记。去掉口头禅与重复，不编造事实，不添加原文没有的信息。只输出润色后的正文，不要标题或解释。";
 
-/** One GitHub release that can supply an installable plugin package. */
+/** How a remote package entry was discovered (UI badge). */
+export type PluginFetchChannel = "release" | "tags" | "code";
+
+/** One GitHub release/tag/code snapshot that can supply an installable plugin package. */
 export type PluginReleaseCacheEntry = {
 	/** Semver without leading v, e.g. 0.2.0 */
 	version: string;
@@ -245,8 +248,15 @@ export type PluginReleaseCacheEntry = {
 	body: string;
 	/** Direct zip asset URL (browser_download_url) */
 	downloadUrl: string;
-	/** GitHub release page */
+	/** GitHub release / tag page */
 	htmlUrl: string;
+	/**
+	 * How this entry was obtained.
+	 * release = Release 附件 zip；tags = Tags 源码 zip；code = Code Download ZIP
+	 */
+	fetchChannel?: PluginFetchChannel;
+	/** Short Chinese label, e.g. 「Release 附件」 */
+	fetchChannelLabel?: string;
 };
 
 /** User-configured package source (one row, like an AI provider). */
@@ -343,6 +353,17 @@ export type AiNotebookSettings = {
 		 * Fetching never changes the running package — only explicit "use this version" does.
 		 */
 		sources: PluginVersionSource[];
+		/**
+		 * Package last successfully applied via「使用此版本」/「切换到此本地备份」.
+		 * null = never applied from history UI — do NOT infer from manifest version alone.
+		 * sourceId null means local backup.
+		 */
+		appliedPackage: {
+			version: string;
+			sourceId: string | null;
+			sourceName: string;
+			at: string;
+		} | null;
 	};
 };
 

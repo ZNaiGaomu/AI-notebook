@@ -207,15 +207,14 @@ export class VersionHistoryModal extends Modal {
 		parent.createEl("p", {
 			cls: "setting-item-description",
 			text:
-				`当前运行：v${installed}` +
-				(hist.preferredPluginVersion
-					? ` · 偏好标记：${hist.preferredPluginVersion}`
-					: "") +
+				`本机 manifest 版本：v${installed}` +
+				(hist.appliedPackage
+					? ` · 当前使用：${hist.appliedPackage.sourceName} · v${hist.appliedPackage.version}`
+					: " · 当前使用：尚未从历史页应用过（仅版本号相同≠正在用远程包）") +
 				`。` +
-				`下方可添加多个 GitHub 来源（类似 AI 服务商，一行一个）。` +
-				`「拉取版本」只更新该来源的可选列表与本地缓存，不会改当前运行包；` +
-				`只有点「使用此版本」才会覆盖 main.js / manifest.json / styles.css（不碰 data.json 与笔记）。` +
-				`同版本号不同来源分开存档。`,
+				`本地备份与每个 GitHub 来源各是独立列表。` +
+				`「拉取版本」只更新可选列表（优先 Release 附件 → Tags → Code ZIP），不改运行包；` +
+				`只有「下载并使用 / 使用此版本 / 切换到此本地备份」成功后才标记当前使用。`,
 		});
 
 		// Add source row
@@ -460,7 +459,12 @@ export class VersionHistoryModal extends Modal {
 					? ` · 上次拉取 ${formatLocalDateTime(src.lastFetchedAt)}`
 					: " · 尚未拉取，请点「拉取版本」") +
 				`。下载只写入 package-archive/by-source/${src.id}/v…/；` +
-				`「使用此版本」才会覆盖运行包。当前运行 v${installed}。`,
+				`「使用此版本」才会覆盖运行包并标记当前使用。` +
+				`本机 manifest v${installed}` +
+				(this.plugin.settings.pluginHistory.appliedPackage
+					? ` · 当前使用：${this.plugin.settings.pluginHistory.appliedPackage.sourceName} v${this.plugin.settings.pluginHistory.appliedPackage.version}`
+					: " · 尚未从历史页应用过远程包") +
+				`。`,
 		});
 
 		const toolbar = parent.createDiv({ cls: "ai-notebook-settings-actions" });
@@ -477,7 +481,7 @@ export class VersionHistoryModal extends Modal {
 		if (releases.length === 0) {
 			parent.createDiv({
 				cls: "ai-notebook-empty",
-				text: "暂无版本缓存。点「拉取 / 刷新版本」：会依次尝试 Release → Tags → jsDelivr → 页面解析 → 默认分支。",
+				text: "暂无版本缓存。点「拉取 / 刷新版本」：优先 Release 安装包 → 否则 Tags → 再否则 Code Download ZIP。",
 			});
 			return;
 		}
@@ -497,16 +501,24 @@ export class VersionHistoryModal extends Modal {
 		installed: string,
 	): Promise<void> {
 		const row = parent.createDiv({ cls: "ai-notebook-version-card" });
-		const isCurrent = rel.version === installed;
+		const applied = this.plugin.settings.pluginHistory.appliedPackage;
+		const isCurrent =
+			!!applied &&
+			applied.sourceId === src.id &&
+			applied.version === rel.version;
 		if (isCurrent) row.addClass("is-current");
 
 		const head = row.createDiv({ cls: "ai-notebook-version-card-head" });
 		head.createEl("h4", {
-			text: `v${rel.version}${isCurrent ? "（当前运行版本号）" : ""}`,
+			text: `v${rel.version}${isCurrent ? "（当前使用）" : ""}`,
 		});
 		head.createSpan({
 			cls: "ai-notebook-version-author",
 			text: src.name,
+		});
+		head.createSpan({
+			cls: "ai-notebook-version-author",
+			text: rel.fetchChannelLabel || channelLabel(rel.fetchChannel),
 		});
 
 		row.createDiv({
@@ -526,11 +538,14 @@ export class VersionHistoryModal extends Modal {
 			text: "版本说明 / 相对变化",
 		});
 		const ul = detailsBox.createEl("ul");
+		ul.createEl("li", {
+			text: `拉取方式：${rel.fetchChannelLabel || channelLabel(rel.fetchChannel)}`,
+		});
 		const bodyLines = summarizeReleaseBody(rel.body, 10);
 		if (bodyLines.length) {
 			for (const line of bodyLines) ul.createEl("li", { text: line });
 		} else {
-			ul.createEl("li", { text: "此 Release 未提供说明正文。" });
+			ul.createEl("li", { text: "暂无更多说明正文。" });
 		}
 		// built-in capability hints for same version
 		const caps = listPluginCapabilitiesNewestFirst().filter(
@@ -551,11 +566,18 @@ export class VersionHistoryModal extends Modal {
 			src.id,
 			rel.version,
 		);
+		const statusBits: string[] = [];
+		if (isCurrent) statusBits.push("状态：当前使用（已从本条应用）");
+		else if (hasLocal) statusBits.push("状态：已下载到本地（未作为当前使用）");
+		else statusBits.push("状态：未下载");
+		if (hasLocal) {
+			statusBits.push(
+				`存档：package-archive/by-source/${src.id}/v${rel.version}`,
+			);
+		}
 		row.createDiv({
 			cls: "ai-notebook-version-time",
-			text: hasLocal
-				? `本地存档：已下载（package-archive/by-source/${src.id}/v${rel.version}）`
-				: "本地存档：未下载",
+			text: statusBits.join(" · "),
 		});
 
 		const actions = row.createDiv({ cls: "ai-notebook-settings-actions" });
@@ -653,9 +675,21 @@ export class VersionHistoryModal extends Modal {
 				this.plugin.settings,
 				rel.version,
 			);
+			this.plugin.settings = {
+				...this.plugin.settings,
+				pluginHistory: {
+					...this.plugin.settings.pluginHistory,
+					appliedPackage: {
+						version: rel.version,
+						sourceId: src.id,
+						sourceName: src.name,
+						at: new Date().toISOString(),
+					},
+				},
+			};
 			await this.plugin.saveSettings();
 			new Notice(
-				`已写入「${src.name}」v${rel.version}。请立即：禁用再启用「AI 记录本」，或重启 Obsidian。`,
+				`已应用「${src.name}」v${rel.version}（${rel.fetchChannelLabel || "远程包"}）。请立即：禁用再启用「AI 记录本」，或重启 Obsidian。`,
 				12000,
 			);
 			this.render();
@@ -679,12 +713,16 @@ export class VersionHistoryModal extends Modal {
 		}
 		for (const bak of backups) {
 			const row = host.createDiv({ cls: "ai-notebook-version-card" });
-			const isCurrent = bak.version === installed;
+			const applied = this.plugin.settings.pluginHistory.appliedPackage;
+			const isCurrent =
+				!!applied &&
+				applied.sourceId == null &&
+				applied.version === bak.version;
 			if (isCurrent) row.addClass("is-current");
 
 			const head = row.createDiv({ cls: "ai-notebook-version-card-head" });
 			head.createEl("h4", {
-				text: `v${bak.version}${isCurrent ? "（版本号与当前运行相同）" : ""}`,
+				text: `v${bak.version}${isCurrent ? "（当前使用 · 本地备份）" : ""}`,
 			});
 			head.createSpan({
 				cls: "ai-notebook-version-author",
@@ -747,9 +785,21 @@ export class VersionHistoryModal extends Modal {
 				this.plugin.settings,
 				version,
 			);
+			this.plugin.settings = {
+				...this.plugin.settings,
+				pluginHistory: {
+					...this.plugin.settings.pluginHistory,
+					appliedPackage: {
+						version,
+						sourceId: null,
+						sourceName: "本地运行备份",
+						at: new Date().toISOString(),
+					},
+				},
+			};
 			await this.plugin.saveSettings();
 			new Notice(
-				`已写入本地备份 v${version}。请立即：禁用再启用「AI 记录本」，或重启 Obsidian。`,
+				`已应用本地备份 v${version}。请立即：禁用再启用「AI 记录本」，或重启 Obsidian。`,
 				12000,
 			);
 			this.render();
@@ -837,4 +887,12 @@ function formatRelative(iso: string): string {
 	const mon = Math.round(day / 30);
 	if (mon < 12) return `${mon} 个月前`;
 	return `${Math.round(mon / 12)} 年前`;
+}
+
+
+function channelLabel(ch?: string | null): string {
+	if (ch === "release") return "Release 附件";
+	if (ch === "tags") return "Tags 源码包";
+	if (ch === "code") return "Code Download ZIP";
+	return "远程包";
 }

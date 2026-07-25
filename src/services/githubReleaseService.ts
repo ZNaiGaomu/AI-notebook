@@ -295,11 +295,9 @@ async function fromReleasesApi(
 		const tag = raw.tag_name || "";
 		const version = stripV(tag);
 		if (!version) continue;
+		// Only real Release zip attachments count for priority-1 channel
 		const asset = pickZipAsset(raw.assets);
-		// Prefer release zip asset; else fall back to tag codeload for this tag
-		const downloadUrl = asset?.browser_download_url
-			? asset.browser_download_url
-			: githubTagZipUrl(owner, repo, tag || `v${version}`);
+		if (!asset?.browser_download_url) continue;
 		out.push({
 			version,
 			tagName: tag || `v${version}`,
@@ -307,16 +305,16 @@ async function fromReleasesApi(
 			publishedAt: raw.published_at || "",
 			body:
 				(typeof raw.body === "string" ? raw.body : "") ||
-				(asset
-					? "来源：GitHub Release 附件"
-					: "来源：GitHub Release（无 zip 附件，将用 tag 源码包 + release/ai-notebook）"),
-			downloadUrl,
+				"GitHub Release 安装包附件",
+			downloadUrl: asset.browser_download_url,
 			htmlUrl:
 				raw.html_url ||
 				`https://github.com/${owner}/${repo}/releases/tag/${encodeURIComponent(tag || version)}`,
+			fetchChannel: "release",
+			fetchChannelLabel: "Release 附件",
 		});
 	}
-	trace.push(`Releases API：${out.length} 条`);
+	trace.push(`Release 安装包：${out.length} 条`);
 	return out;
 }
 
@@ -408,6 +406,8 @@ async function fromJsDelivr(
 			body: "来源：jsDelivr 标签列表 · 下载 = GitHub Tags 源码 zip（内含 release/ai-notebook）",
 			downloadUrl: githubTagZipUrl(owner, repo, tagName),
 			htmlUrl: `https://github.com/${owner}/${repo}/releases/tag/${encodeURIComponent(tagName)}`,
+			fetchChannel: "tags",
+			fetchChannelLabel: "Tags 源码包",
 		});
 	}
 	trace.push(
@@ -465,9 +465,11 @@ async function fromTagsHtml(
 			tagName: tag,
 			name: tag,
 			publishedAt: "",
-			body: "来源：GitHub Tags 页面（与网页 zip 按钮相同）",
+			body: "Tags 页面 zip（与网页按钮相同）",
 			downloadUrl: githubTagZipUrl(owner, repo, tag),
 			htmlUrl: `https://github.com/${owner}/${repo}/releases/tag/${encodeURIComponent(tag)}`,
+			fetchChannel: "tags",
+			fetchChannelLabel: "Tags 源码包",
 		});
 	}
 	out.sort((a, b) =>
@@ -508,6 +510,8 @@ async function fromDefaultBranch(
 						body: `来源：Code → Download ZIP（分支 ${branch} 最新快照；提取 release/ai-notebook 或根目录三文件）`,
 						downloadUrl: codeloadBranchZipUrl(owner, repo, branch),
 						htmlUrl: `https://github.com/${owner}/${repo}/tree/${branch}`,
+						fetchChannel: "code",
+						fetchChannelLabel: "Code Download ZIP",
 					},
 				];
 			} catch {
@@ -539,46 +543,70 @@ export async function fetchGithubReleases(
 	repo: string,
 ): Promise<FetchPackagesResult> {
 	const trace: string[] = [];
-	const map = new Map<string, PluginReleaseCacheEntry>();
 
-	// Always try multiple channels and MERGE (do not stop early).
-	// Tags page is the most reliable when the repo has tags but no Release assets.
-	// api.github.com often returns 403 from desktop without a token.
+	// Priority chain (first non-empty channel wins — do NOT mix):
+	// 1) Release 安装包附件
+	// 2) Tags 源码 zip
+	// 3) Code → Download ZIP（默认分支最新）
 
-	// 1) Tags HTML page (same list user sees at /tags — zip buttons)
-	mergeEntries(map, await fromTagsHtml(owner, repo, trace));
-	// 2) jsDelivr tag list (no GitHub API quota)
-	mergeEntries(map, await fromJsDelivr(owner, repo, trace));
-	// 3) Releases API (zip assets when present)
-	mergeEntries(map, await fromReleasesApi(owner, repo, trace));
-	// 4) Tags API
-	mergeEntries(map, await fromTagsApi(owner, repo, trace));
-	// 5) Code → Download ZIP = default branch latest (extra entry)
-	mergeEntries(map, await fromDefaultBranch(owner, repo, trace));
+	const releaseItems = await fromReleasesApi(owner, repo, trace);
+	if (releaseItems.length > 0) {
+		const releases = sortReleases(releaseItems);
+		trace.push(`采用通道：Release 附件（${releases.length}）`);
+		return { ok: true, releases, trace };
+	}
 
-	const releases = [...map.values()].sort((a, b) => {
+	const tagMap = new Map<string, PluginReleaseCacheEntry>();
+	mergeEntries(tagMap, await fromTagsHtml(owner, repo, trace));
+	if (tagMap.size === 0) {
+		mergeEntries(tagMap, await fromJsDelivr(owner, repo, trace));
+	}
+	if (tagMap.size === 0) {
+		mergeEntries(tagMap, await fromTagsApi(owner, repo, trace));
+	}
+	for (const e of tagMap.values()) {
+		e.fetchChannel = e.fetchChannel ?? "tags";
+		e.fetchChannelLabel = e.fetchChannelLabel ?? "Tags 源码包";
+	}
+	if (tagMap.size > 0) {
+		const releases = sortReleases([...tagMap.values()]);
+		trace.push(
+			`采用通道：Tags（${releases.length}：${releases.map((r) => r.tagName || r.version).join(", ")}）`,
+		);
+		return { ok: true, releases, trace };
+	}
+
+	const codeItems = await fromDefaultBranch(owner, repo, trace);
+	for (const e of codeItems) {
+		e.fetchChannel = "code";
+		e.fetchChannelLabel = "Code Download ZIP";
+	}
+	if (codeItems.length > 0) {
+		trace.push(`采用通道：Code Download ZIP（${codeItems.length}）`);
+		return { ok: true, releases: codeItems, trace };
+	}
+
+	return {
+		ok: false,
+		error:
+			`未能从 ${owner}/${repo} 获取任何可安装版本。\n` +
+			`已按优先级尝试：① Release 附件 → ② Tags 源码包 → ③ Code Download ZIP。\n` +
+			trace.join(" · "),
+		trace,
+	};
+}
+
+function sortReleases(
+	items: PluginReleaseCacheEntry[],
+): PluginReleaseCacheEntry[] {
+	return [...items].sort((a, b) => {
 		const aBranch = a.tagName === "main" || a.tagName === "master" ? 1 : 0;
 		const bBranch = b.tagName === "main" || b.tagName === "master" ? 1 : 0;
 		if (aBranch !== bBranch) return aBranch - bBranch;
 		return b.version.localeCompare(a.version, undefined, { numeric: true });
 	});
-
-	if (releases.length === 0) {
-		return {
-			ok: false,
-			error:
-				`未能从 ${owner}/${repo} 获取任何可安装版本。\n` +
-				`已尝试：Tags 页面 / jsDelivr / Release / Tags API / 默认分支 Code ZIP。\n` +
-				trace.join(" · "),
-			trace,
-		};
-	}
-
-	trace.push(
-		`合计唯一版本：${releases.length}（${releases.map((r) => r.tagName || r.version).join(", ")}）`,
-	);
-	return { ok: true, releases, trace };
 }
+
 
 
 /** Download a zip as ArrayBuffer; try alternate archive URLs on failure. */
