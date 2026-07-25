@@ -151,12 +151,31 @@ export type ProviderProfile = {
 	apiKey: string;
 	models: string[];
 	defaultModel: string;
+	/**
+	 * Explicit fan-out priority per model id (unique positive ints: 1, 2, 3…).
+	 * Only models with a priority participate when purpose slot uses「服务商默认」.
+	 * Smaller number = higher priority. Priorities > modelFanout N are ignored for that run.
+	 */
+	modelPriority?: Record<string, number>;
 };
 
-/** One ordered slot in a purpose → model chain (fallback order). */
+/**
+ * One ordered slot in a purpose → model chain (fallback order).
+ *
+ * Model selection modes (A/B/C):
+ * - model == null && !modelPriority → A: provider.modelPriority 1..N
+ * - model == null && modelPriority set → B: purpose-local priorities 1..N
+ * - model set → C: only that single model
+ */
 export type RouteSlot = {
 	providerId: string | null;
+	/** Explicit model id (C). null = use default fan-out (A or B). */
 	model: string | null;
+	/**
+	 * Purpose-local priorities for this slot's provider (B).
+	 * Unique positive ints; empty/undefined → fall back to provider-level (A).
+	 */
+	modelPriority?: Record<string, number>;
 };
 
 /**
@@ -173,11 +192,84 @@ export type PurposeRouting = {
 /** Max ordered fallbacks shown in settings UI. */
 export const PURPOSE_ROUTE_CHAIN_LEN = 3;
 
+
+
+/** Browser recording container format (mp3 may fall back if unsupported). */
+export type VoiceRecordFormat = "auto" | "wav" | "webm" | "m4a" | "mp3";
+
+/**
+ * Voice capture + STT + optional polish (post-transcript rewrite).
+ * Independent of blueprint organize (field extract).
+ */
+export type VoiceFeatureSettings = {
+	/** Preferred recording container; auto negotiates with MediaRecorder. */
+	recordFormat: VoiceRecordFormat;
+	/**
+	 * When purpose slot uses provider default model, try up to this many models
+	 * inside that provider before moving to the next purpose slot.
+	 */
+	modelFanout: number;
+	/**
+	 * Prefer re-encoding to 16k mono WAV before STT when source is not wav
+	 * (helps some OpenAI-compatible gateways).
+	 */
+	transcodeWavForStt: boolean;
+	/**
+	 * After STT fails, try chat multimodal "listen".
+	 * Default true (restore usable path when mid-proxy has no /audio/transcriptions).
+	 */
+	allowChatAudioFallback: boolean;
+	/** Saved position for draggable voice progress chip (px from viewport top-left). */
+	chipPosition: { left: number; top: number } | null;
+	polish: {
+		/** Default on: after STT, rewrite transcript with a chat model. */
+		enabled: boolean;
+		providerId: string | null;
+		model: string | null;
+		prompt: string;
+	};
+};
+
+export const DEFAULT_VOICE_POLISH_PROMPT =
+	"请将下面的语音转写原文润色为通顺、分段清晰的中文笔记。去掉口头禅与重复，不编造事实，不添加原文没有的信息。只输出润色后的正文，不要标题或解释。";
+
+/** One GitHub release that can supply an installable plugin package. */
+export type PluginReleaseCacheEntry = {
+	/** Semver without leading v, e.g. 0.2.0 */
+	version: string;
+	tagName: string;
+	/** Release title */
+	name: string;
+	publishedAt: string;
+	/** Release body / notes (may be empty) */
+	body: string;
+	/** Direct zip asset URL (browser_download_url) */
+	downloadUrl: string;
+	/** GitHub release page */
+	htmlUrl: string;
+};
+
+/** User-configured package source (one row, like an AI provider). */
+export type PluginVersionSource = {
+	id: string;
+	/** Display name, e.g. 官方主仓 */
+	name: string;
+	/** Original URL the user pasted */
+	repoUrl: string;
+	owner: string;
+	repo: string;
+	lastFetchedAt: string | null;
+	/** Last successfully fetched release list (does not affect running package) */
+	cachedReleases: PluginReleaseCacheEntry[];
+};
+
 export type AiNotebookSettings = {
 	schemaVersion: number;
 	providers: ProviderProfile[];
 	defaultProviderId: string | null;
 	purposeRouting: PurposeRouting;
+	/** Voice recording format, STT fan-out, polish */
+	voice: VoiceFeatureSettings;
 	paths: {
 		notebooksRoot: string;
 		attachmentsRoot: string;
@@ -246,6 +338,11 @@ export type AiNotebookSettings = {
 			relatedCapabilityId?: string;
 			relatedPluginVersion?: string;
 		}>;
+		/**
+		 * Multi-row GitHub package sources (like AI providers).
+		 * Fetching never changes the running package — only explicit "use this version" does.
+		 */
+		sources: PluginVersionSource[];
 	};
 };
 

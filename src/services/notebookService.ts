@@ -38,7 +38,22 @@ export class NotebookService {
 			const metaPath = notebookMetaPath(settings, folder.name);
 			if (!(await this.vault.exists(metaPath))) continue;
 			try {
-				const meta = await this.readMeta(folder.name);
+				let meta = await this.readMeta(folder.name);
+				// Repair display name if vault folder was renamed outside the plugin
+				if (meta.name !== folder.name || meta.folderName !== folder.name) {
+					const fixed = {
+						...meta,
+						folderName: folder.name,
+						name: folder.name,
+						updated: nowIso(),
+					};
+					try {
+						await this.writeMeta(fixed);
+						meta = fixed;
+					} catch {
+						meta = fixed;
+					}
+				}
 				result.push(meta);
 			} catch {
 				// skip invalid
@@ -171,7 +186,91 @@ export class NotebookService {
 		return next;
 	}
 
-	async findById(notebookId: string): Promise<NotebookMeta | null> {
+	/**
+	 * Rename notebook folder + display name together.
+	 * If only the vault folder was renamed externally, call syncNameFromFolder.
+	 */
+	async renameNotebook(
+		meta: NotebookMeta,
+		newName: string,
+	): Promise<NotebookMeta> {
+		const settings = this.getSettings();
+		const name = newName.trim() || meta.name;
+		let folderName = sanitizeFolderName(name);
+		const root = notebooksRoot(settings);
+		const from = notebookFolderPath(settings, meta.folderName);
+		// unique target
+		let candidate = folderName;
+		let n = 2;
+		while (
+			candidate !== meta.folderName &&
+			(await this.vault.exists(notebookFolderPath(settings, candidate)))
+		) {
+			candidate = `${folderName}-${n}`;
+			n++;
+		}
+		folderName = candidate;
+		if (folderName !== meta.folderName) {
+			const to = notebookFolderPath(settings, folderName);
+			await this.vault.move(from, to);
+		}
+		const next: NotebookMeta = {
+			...meta,
+			name,
+			folderName,
+			updated: nowIso(),
+		};
+		await this.writeMeta(next);
+		return next;
+	}
+
+	/**
+	 * After external folder rename: folderName is new path segment;
+	 * keep display name in sync with folder name (user expectation).
+	 */
+	async syncAfterFolderRename(
+		oldFolderName: string,
+		newFolderName: string,
+	): Promise<NotebookMeta | null> {
+		const settings = this.getSettings();
+		const metaPath = notebookMetaPath(settings, newFolderName);
+		if (!(await this.vault.exists(metaPath))) return null;
+		try {
+			const meta = await this.readMeta(newFolderName);
+			const next: NotebookMeta = {
+				...meta,
+				folderName: newFolderName,
+				name: newFolderName,
+				updated: nowIso(),
+			};
+			await this.writeMeta(next);
+			return next;
+		} catch {
+			return null;
+		}
+	}
+
+	/** Force display name = folder name for one notebook folder. */
+	async alignNameToFolder(folderName: string): Promise<NotebookMeta | null> {
+		try {
+			const meta = await this.readMeta(folderName);
+			if (meta.name === folderName && meta.folderName === folderName) {
+				return meta;
+			}
+			const next: NotebookMeta = {
+				...meta,
+				folderName,
+				name: folderName,
+				updated: nowIso(),
+			};
+			await this.writeMeta(next);
+			return next;
+		} catch {
+			return null;
+		}
+	}
+
+		async findById(notebookId: string): Promise<NotebookMeta | null> {
 		const all = await this.listNotebooks();
 		return all.find((n) => n.notebook_id === notebookId) ?? null;
 	}

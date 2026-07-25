@@ -156,6 +156,11 @@ export class OrganizeService {
 			sourceHint?: string;
 			/** Mobile queue / capture instant (ISO or epoch ms) */
 			capturedAt?: string | number | null;
+			/**
+			 * Markdown that must survive AI rewrite (e.g. audio embed).
+			 * Appended if missing after organize.
+			 */
+			preserveEmbedsFrom?: string;
 		},
 	): Promise<{ item: NotebookItem; organized: boolean; error?: string }> {
 		const useAi = opts?.useAi !== false;
@@ -163,6 +168,7 @@ export class OrganizeService {
 		let body = rawText;
 		let fields: Record<string, unknown> = {};
 		let organized = false;
+		const embedSource = opts?.preserveEmbedsFrom || rawText;
 
 		if (useAi) {
 			const result = await this.organizeText(meta, rawText, {
@@ -174,13 +180,14 @@ export class OrganizeService {
 				body = result.summary
 					? `> ${result.summary}\n\n${result.body}`
 					: result.body;
+				body = ensureVaultEmbeds(embedSource, body);
 				fields = { ...result.fields };
 				organized = true;
 			} else {
-				// fallback: still create raw item
+				// fallback: still create raw item (keep embeds)
 				const item = await this.items.createItem(meta, {
 					title,
-					body,
+					body: ensureVaultEmbeds(embedSource, body),
 					entityType: opts?.entityType,
 					capturedAt: opts?.capturedAt,
 					fields: {
@@ -197,6 +204,8 @@ export class OrganizeService {
 					error: result.error,
 				};
 			}
+		} else {
+			body = ensureVaultEmbeds(embedSource, body);
 		}
 
 		const item = await this.items.createItem(meta, {
@@ -271,6 +280,19 @@ export class OrganizeService {
 			)
 			.join(" | ");
 	}
+}
+
+/** Keep vault wikilink embeds (e.g. audio) after AI rewrites body. */
+function ensureVaultEmbeds(original: string, nextBody: string): string {
+	const embeds = original.match(/!\[\[[^\]]+\]\]/g) ?? [];
+	if (!embeds.length) return nextBody;
+	let out = nextBody;
+	const missing: string[] = [];
+	for (const e of embeds) {
+		if (!out.includes(e)) missing.push(e);
+	}
+	if (!missing.length) return out;
+	return `${out.trimEnd()}\n\n## 录音\n\n${missing.join("\n")}\n`;
 }
 
 function extractOrganizeJson(text: string):

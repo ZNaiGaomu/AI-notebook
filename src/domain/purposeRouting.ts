@@ -27,28 +27,19 @@ export function normalizeRouteChain(raw: unknown): RouteSlot[] {
 		}
 	}
 
-	// Drop pure-empty trailing slots later; keep first N with content padded
-	const trimmed = slots.filter(
-		(s, i) =>
-			s.providerId ||
-			s.model ||
-			// keep leading structure only up to last non-empty
-			false,
-	);
-	// Prefer: keep all non-empty in order, then pad to CHAIN_LEN for UI
-	const nonEmpty = slots.filter((s) => s.providerId || s.model);
-	const out: RouteSlot[] = [];
-	for (let i = 0; i < PURPOSE_ROUTE_CHAIN_LEN; i++) {
-		out.push(nonEmpty[i] ?? emptySlot());
+	// Keep ALL slots from settings (including empty rows user added via +).
+	// Only pad up to PURPOSE_ROUTE_CHAIN_LEN when shorter; never truncate.
+	const out: RouteSlot[] = slots.length ? [...slots] : [];
+	while (out.length < PURPOSE_ROUTE_CHAIN_LEN) {
+		out.push(emptySlot());
 	}
-	// If everything empty, still return 3 nulls
-	void trimmed;
 	return out;
 }
 
 export function normalizeSlot(raw: unknown): RouteSlot {
 	if (!raw || typeof raw !== "object") return emptySlot();
 	const o = raw as Record<string, unknown>;
+	const modelPriority = normalizeSlotPriority(o.modelPriority);
 	return {
 		providerId:
 			typeof o.providerId === "string" && o.providerId.trim()
@@ -58,7 +49,25 @@ export function normalizeSlot(raw: unknown): RouteSlot {
 			typeof o.model === "string" && o.model.trim()
 				? o.model.trim()
 				: null,
+		...(modelPriority ? { modelPriority } : {}),
 	};
+}
+
+function normalizeSlotPriority(
+	raw: unknown,
+): Record<string, number> | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const used = new Set<number>();
+	const out: Record<string, number> = {};
+	for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+		const n = typeof v === "number" ? v : Number(v);
+		if (!k.trim() || !Number.isFinite(n) || n < 1) continue;
+		const prio = Math.floor(n);
+		if (used.has(prio)) continue;
+		used.add(prio);
+		out[k.trim()] = prio;
+	}
+	return Object.keys(out).length ? out : undefined;
 }
 
 /** First non-empty slot (legacy-compatible view of a chain). */

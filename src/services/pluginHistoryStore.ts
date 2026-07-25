@@ -27,6 +27,8 @@ export type PluginHistoryState = {
 	 */
 	preferredPluginVersion: string | null;
 	userNotes: PluginUserNote[];
+	/** GitHub package sources — full type lives on AiNotebookSettings.pluginHistory */
+	sources: AiNotebookSettings["pluginHistory"]["sources"];
 };
 
 export function defaultPluginHistory(): PluginHistoryState {
@@ -34,6 +36,7 @@ export function defaultPluginHistory(): PluginHistoryState {
 		lastSeenCapabilityId: null,
 		preferredPluginVersion: null,
 		userNotes: [],
+		sources: [],
 	};
 }
 
@@ -74,6 +77,7 @@ export function normalizePluginHistory(raw: unknown): PluginHistoryState {
 				? (r.preferredPluginVersion ?? null)
 				: null,
 		userNotes: notes,
+			sources: Array.isArray(r.sources) ? r.sources : [],
 	};
 }
 
@@ -95,6 +99,7 @@ export function syncPluginHistoryOnLoad(
 	const latest = latestPluginCapability();
 	const nextHist: PluginHistoryState = {
 		...hist,
+		sources: hist.sources ?? [],
 		lastSeenCapabilityId: latest?.id ?? lastId,
 		// first install: mark preferred as current package if empty
 		preferredPluginVersion:
@@ -121,7 +126,7 @@ export function syncPluginHistoryOnLoad(
 	return {
 		settings: {
 			...settings,
-			pluginHistory: { ...nextHist, userNotes },
+			pluginHistory: { ...nextHist, userNotes, sources: nextHist.sources ?? [] },
 		},
 		newCaps,
 	};

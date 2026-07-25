@@ -1,8 +1,11 @@
 import { App, Modal, Notice, Setting } from "obsidian";
+import type { VoiceRecordFormat } from "../domain/types";
 import {
 	canUseMicrophone,
-	startWavCapture,
-	type WavCaptureHandle,
+	negotiateRecordFormat,
+	startMediaRecorderCapture,
+	type MediaRecordHandle,
+	type NegotiatedRecordFormat,
 } from "../infra/audioWav";
 
 export type VoiceRecordResult =
@@ -10,20 +13,25 @@ export type VoiceRecordResult =
 	| { ok: false; error: string; cancelled?: boolean };
 
 /**
- * Start/stop voice recorder → WAV (Whisper-friendly).
+ * Start/stop voice recorder with configurable container format.
  */
 export class VoiceRecordModal extends Modal {
 	private resolveFn: ((r: VoiceRecordResult) => void) | null = null;
-	private capture: WavCaptureHandle | null = null;
+	private capture: MediaRecordHandle | null = null;
 	private stream: MediaStream | null = null;
 	private startedAt = 0;
 	private timerEl: HTMLElement | null = null;
 	private timerHandle: number | null = null;
 	private statusEl: HTMLElement | null = null;
 	private recording = false;
+	private negotiated: NegotiatedRecordFormat;
 
-	constructor(app: App) {
+	constructor(
+		app: App,
+		private readonly formatPref: VoiceRecordFormat = "auto",
+	) {
 		super(app);
+		this.negotiated = negotiateRecordFormat(formatPref);
 	}
 
 	waitForResult(): Promise<VoiceRecordResult> {
@@ -38,7 +46,7 @@ export class VoiceRecordModal extends Modal {
 		contentEl.empty();
 		contentEl.createEl("h2", { text: "语音录入" });
 		contentEl.createEl("p", {
-			text: "点击开始录音，说完后点停止。音频将转为 WAV 再提交转写（兼容更多上游）。",
+			text: `点击开始录音，说完后点停止。当前格式：${this.negotiated.label}（可在设置中更改）。`,
 			cls: "setting-item-description",
 		});
 
@@ -78,7 +86,6 @@ export class VoiceRecordModal extends Modal {
 			this.finish({ ok: false, error: "已取消", cancelled: true });
 		});
 
-		// Manual paste fallback
 		new Setting(contentEl)
 			.setName("转写失败时")
 			.setDesc("可粘贴已有文字直接入库")
@@ -86,8 +93,6 @@ export class VoiceRecordModal extends Modal {
 				b.setButtonText("改用文字输入").onClick(() => {
 					const text = window.prompt("粘贴或输入要记录的文字：");
 					if (text == null || !text.trim()) return;
-					// Encode as fake "transcript via text" — caller expects audio;
-					// signal cancel and let parent use text — use special finish
 					this.finish({
 						ok: false,
 						error: `TEXT_FALLBACK:${text.trim()}`,
@@ -124,12 +129,17 @@ export class VoiceRecordModal extends Modal {
 					channelCount: 1,
 				},
 			});
-			this.capture = await startWavCapture(this.stream);
+			this.capture = await startMediaRecorderCapture(
+				this.stream,
+				this.negotiated,
+			);
 			this.recording = true;
 			this.startedAt = Date.now();
 			startBtn.disabled = true;
 			stopBtn.disabled = false;
-			if (this.statusEl) this.statusEl.setText("录音中…（WAV）");
+			if (this.statusEl) {
+				this.statusEl.setText(`录音中…（${this.negotiated.label}）`);
+			}
 			this.timerHandle = window.setInterval(() => {
 				const sec = Math.floor((Date.now() - this.startedAt) / 1000);
 				const m = String(Math.floor(sec / 60)).padStart(2, "0");
@@ -149,21 +159,21 @@ export class VoiceRecordModal extends Modal {
 			this.finish({ ok: false, error: "未在录音" });
 			return;
 		}
-		if (this.statusEl) this.statusEl.setText("生成 WAV…");
+		if (this.statusEl) this.statusEl.setText("生成音频…");
 		if (this.timerHandle != null) {
 			window.clearInterval(this.timerHandle);
 			this.timerHandle = null;
 		}
 		this.recording = false;
 		try {
-			const { blob, durationMs } = await this.capture.stop();
+			const { blob, durationMs, filename } = await this.capture.stop();
 			this.capture = null;
 			this.stream = null;
 			this.finish({
 				ok: true,
 				blob,
 				durationMs,
-				filename: "audio.wav",
+				filename: filename || `audio.${this.negotiated.extension}`,
 			});
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);

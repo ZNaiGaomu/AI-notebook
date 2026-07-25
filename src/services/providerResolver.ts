@@ -38,6 +38,8 @@ export function resolveProvider(
 
 /**
  * Ordered list of usable providers for a purpose (settings chain → default).
+ * When a slot uses「服务商默认模型」(model null), expands up to voice.modelFanout
+ * models inside that provider (purpose-aware ranking), then moves to next slot.
  * Deduplicates identical providerId+model pairs.
  */
 export function resolveProviderChain(
@@ -52,85 +54,126 @@ export function resolveProviderChain(
 		notebook.model_overrides[purpose]!.trim()
 			? notebook.model_overrides[purpose]!.trim()
 			: null;
+	const fanout = Math.max(1, Math.floor(settings.voice?.modelFanout ?? 6));
+	const wantStt = Boolean(need?.stt || purpose === "voice");
+	const wantVision = Boolean(need?.vision);
 
 	const candidates: Array<{
 		providerId: string | null;
 		model: string | null;
 		slotIndex: number;
+		modelPriority?: Record<string, number>;
 	}> = [];
 
-	for (let i = 0; i < Math.max(slots.length, PURPOSE_ROUTE_CHAIN_LEN); i++) {
+	for (let i = 0; i < slots.length; i++) {
 		const slot: RouteSlot = slots[i] ?? {
 			providerId: null,
 			model: null,
 		};
-		if (!slot.providerId && !slot.model) continue;
+		if (!slot.providerId && !slot.model && !slot.modelPriority) continue;
 		candidates.push({
 			providerId: slot.providerId,
 			model: slot.model,
 			slotIndex: i + 1,
+			modelPriority: slot.modelPriority,
 		});
 	}
 
-	// Always append default provider as last resort if not already covered
-	const defaultId =
-		notebook?.provider_profile_id ||
-		settings.defaultProviderId ||
-		settings.providers[0]?.id ||
-		null;
-	if (defaultId) {
-		candidates.push({
-			providerId: defaultId,
-			model: null,
-			slotIndex: candidates.length + 1,
-		});
+	// Only fall back to default provider when purpose chain has NO slots.
+	// If user configured voice/planner/worker order 1..N, never inject extra vendors.
+	if (candidates.length === 0) {
+		const defaultId =
+			notebook?.provider_profile_id ||
+			settings.defaultProviderId ||
+			settings.providers[0]?.id ||
+			null;
+		if (defaultId) {
+			candidates.push({
+				providerId: defaultId,
+				model: null,
+				slotIndex: 1,
+			});
+		}
 	}
 
 	const out: ResolvedProvider[] = [];
 	const seen = new Set<string>();
 
-	const pushResolved = (
-		providerId: string | null,
-		modelOverride: string | null,
+	const pushOne = (
+		profile: ProviderProfile,
+		model: string,
 		slotIndex: number,
-		preferVision: boolean,
 	) => {
-		const pid =
-			providerId ||
-			settings.defaultProviderId ||
-			settings.providers[0]?.id ||
-			null;
-		if (!pid) return;
-		const profile = settings.providers.find((p) => p.id === pid);
-		if (!profile) return;
-		if (!profile.baseUrl.trim() || !profile.apiKey.trim()) return;
-
-		let model =
-			(slotIndex === 1 ? notebookModel : null) ||
-			modelOverride ||
-			profile.defaultModel ||
-			profile.models[0] ||
-			"";
-
-		if (preferVision) {
-			const visionPick = pickVisionModel(profile, model);
-			if (visionPick) model = visionPick;
-		}
-		if (need?.stt || purpose === "voice") {
-			const sttPick = pickSttModel(profile, model);
-			if (sttPick) model = sttPick;
-		}
-		if (!model && purpose === "voice") model = "whisper-1";
-		if (!model && purpose !== "voice") return;
-
-		const key = `${profile.id}::${model}`;
+		const m = (model || "").trim();
+		if (!m && purpose !== "voice") return;
+		const finalModel = m || (purpose === "voice" ? "whisper-1" : "");
+		if (!finalModel) return;
+		// User may prioritize any model including TTS; do not auto-skip here.
+		const key = `${profile.id}::${finalModel}`;
 		if (seen.has(key)) return;
 		seen.add(key);
-		out.push({ profile, model: model || "whisper-1", slotIndex });
+		out.push({ profile, model: finalModel, slotIndex });
 	};
 
-	// Pass 1: if vision needed, prefer slots / models that look vision-capable first
-	if (need?.vision) {
+	const expandSlot = (
+			providerId: string | null,
+			modelOverride: string | null,
+			slotIndex: number,
+			preferVision: boolean,
+			slotPriority?: Record<string, number>,
+		) => {
+			const pid =
+				providerId ||
+				settings.defaultProviderId ||
+				settings.providers[0]?.id ||
+				null;
+			if (!pid) return;
+			const profile = settings.providers.find((p) => p.id === pid);
+			if (!profile) return;
+			if (!profile.baseUrl.trim() || !profile.apiKey.trim()) return;
+
+			// C: explicit model on slot (notebook override only on slot 1)
+			const explicit =
+				(slotIndex === 1 ? notebookModel : null) ||
+				(modelOverride && modelOverride.trim() ? modelOverride.trim() : null);
+
+			if (explicit) {
+				pushOne(profile, explicit, slotIndex);
+				return;
+			}
+
+			// B: purpose-local priorities on this slot
+			// A: provider.modelPriority
+			const effectiveProfile: ProviderProfile = slotPriority
+				? { ...profile, modelPriority: slotPriority }
+				: profile;
+
+			const ranked = rankModelsForPurpose(effectiveProfile, {
+				stt: wantStt,
+				vision: preferVision || wantVision,
+				purpose,
+				maxPriority: fanout,
+			});
+			if (ranked.length === 0 && purpose === "voice") {
+				const fallback =
+					profile.defaultModel ||
+					profile.models[0] ||
+					"whisper-1";
+				pushOne(profile, fallback, slotIndex);
+				return;
+			}
+			if (ranked.length === 0 && purpose !== "voice") {
+				const one =
+					profile.defaultModel || profile.models[0] || "";
+				if (one) pushOne(profile, one, slotIndex);
+				return;
+			}
+			for (const m of ranked) {
+				pushOne(profile, m, slotIndex);
+			}
+		};
+
+	if (wantVision) {
 		for (const c of candidates) {
 			const profile = settings.providers.find(
 				(p) =>
@@ -146,30 +189,109 @@ export function resolveProviderChain(
 				looksVisionCapable(model) ||
 				profile.models.some((m) => looksVisionCapable(m))
 			) {
-				pushResolved(c.providerId, c.model, c.slotIndex, true);
+				expandSlot(c.providerId, c.model, c.slotIndex, true, c.modelPriority);
 			}
 		}
 	}
 
-	// Pass 2: all candidates in configured order
 	for (const c of candidates) {
-		pushResolved(c.providerId, c.model, c.slotIndex, Boolean(need?.vision));
+		expandSlot(c.providerId, c.model, c.slotIndex, wantVision, c.modelPriority);
 	}
 
-	// Pass 3: any remaining configured providers (for vision miss / hard fallback)
-	if (need?.vision || out.length === 0) {
+	// Hard fallback across ALL providers only when nothing was configured
+	// for this purpose (empty chain). Never expand beyond user's purpose table.
+	if (out.length === 0 && candidates.length === 0) {
 		for (let i = 0; i < settings.providers.length; i++) {
 			const p = settings.providers[i]!;
-			pushResolved(
-				p.id,
-				need?.vision ? pickVisionModel(p, null) : null,
-				100 + i,
-				Boolean(need?.vision),
-			);
+			expandSlot(p.id, null, 100 + i, wantVision);
+		}
+	} else if (wantVision && out.length === 0) {
+		// Vision: if configured slots produced nothing usable, still try
+		// remaining providers that look vision-capable (chat with images).
+		for (let i = 0; i < settings.providers.length; i++) {
+			const p = settings.providers[i]!;
+			expandSlot(p.id, null, 100 + i, true);
 		}
 	}
 
 	return out;
+}
+
+/**
+ * Rank models inside a provider for a purpose when slot model is「默认」.
+ * Voice: ASR first, skip TTS. Vision: vision-capable first. Else default + list.
+ */
+export function rankModelsForPurpose(
+	profile: ProviderProfile,
+	opts: {
+		stt?: boolean;
+		vision?: boolean;
+		purpose?: Purpose;
+		/** Max priority number to include (N). */
+		maxPriority?: number;
+	},
+): string[] {
+	const maxP = Math.max(1, Math.floor(opts.maxPriority ?? 6));
+	const pri = profile.modelPriority ?? {};
+
+	// Scheme A: only models with explicit unique priority 1..N
+	const prioritized = Object.entries(pri)
+		.filter(([model, prio]) => {
+			if (!profile.models.includes(model) && model !== profile.defaultModel) {
+				// still allow if listed in models
+			}
+			const inList =
+				profile.models.includes(model) || model === profile.defaultModel;
+			if (!inList) return false;
+			if (typeof prio !== "number" || !Number.isFinite(prio)) return false;
+			const p = Math.floor(prio);
+			if (p < 1 || p > maxP) return false;
+				// Full 1..N poll: include TTS if user set priority
+				return true;
+		})
+		.map(([model, prio]) => ({ model, prio: Math.floor(prio as number) }))
+		.sort((a, b) => a.prio - b.prio || a.model.localeCompare(b.model));
+
+	// Deduplicate by priority (unique already) and model
+	const seenP = new Set<number>();
+	const seenM = new Set<string>();
+	const ordered: string[] = [];
+	for (const e of prioritized) {
+		if (seenP.has(e.prio) || seenM.has(e.model)) continue;
+		seenP.add(e.prio);
+		seenM.add(e.model);
+		ordered.push(e.model);
+	}
+
+	if (ordered.length) return ordered;
+
+	// No priorities configured: legacy heuristic fallback (single default-ish)
+	const pool = uniqueModels([profile.defaultModel, ...profile.models]);
+	if (!pool.length) {
+		return opts.stt || opts.purpose === "voice" ? ["whisper-1"] : [];
+	}
+	if (opts.stt || opts.purpose === "voice") {
+			const asr = pool.filter(looksLikeSttModel);
+			const rest = pool.filter((m) => !looksLikeSttModel(m));
+			return uniqueModels([...asr, ...rest]).slice(0, maxP);
+	}
+	if (opts.vision) {
+		const vis = pool.filter(looksVisionCapable);
+		return (vis[0] ? [vis[0]] : pool.slice(0, 1));
+	}
+	return pool.slice(0, 1);
+}
+
+export function looksLikeSttModel(model: string): boolean {
+	const m = model.toLowerCase();
+	if (!m || looksLikeTtsModel(m)) return false;
+	return /whisper|transcrib|speech|asr|\bstt\b|funasr|mimo-v2\.5-asr/i.test(m);
+}
+
+export function looksLikeTtsModel(model: string): boolean {
+	return /tts|voiceclone|voicedesign|text-to-speech|speech-synthesis/i.test(
+		model.toLowerCase(),
+	);
 }
 
 /**
@@ -186,28 +308,16 @@ export function looksVisionCapable(model: string): boolean {
 	);
 }
 
-function pickVisionModel(
-	profile: ProviderProfile,
-	preferred: string | null,
-): string | null {
-	if (preferred && looksVisionCapable(preferred)) return preferred;
-	const fromList = profile.models.find((m) => looksVisionCapable(m));
-	if (fromList) return fromList;
-	if (preferred) return preferred;
-	return profile.defaultModel || profile.models[0] || null;
-}
-
-function pickSttModel(
-	profile: ProviderProfile,
-	preferred: string | null,
-): string | null {
-	if (preferred && /whisper|transcrib|speech|asr/i.test(preferred)) {
-		return preferred;
+function uniqueModels(arr: Array<string | null | undefined>): string[] {
+	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const a of arr) {
+		const s = (a || "").trim();
+		if (!s || seen.has(s)) continue;
+		seen.add(s);
+		out.push(s);
 	}
-	const stt = profile.models.find((m) =>
-		/whisper|transcrib|speech|asr/i.test(m),
-	);
-	return stt || preferred || profile.defaultModel || profile.models[0] || null;
+	return out;
 }
 
 /** Error text suggests model cannot accept images / multimodal. */

@@ -28,15 +28,15 @@ export class VoiceService {
 		const url = `${base}/audio/transcriptions`;
 		const { name, type, data } = await toUploadBytes(blob, filename);
 
+		// Caller already resolved purpose chain — prefer the given model first.
+		// Only expand to common STT aliases if the primary model fails hard.
+		const primary = (model || "").trim();
 		const modelsToTry = uniqueNonEmpty([
-			looksLikeSttModel(model) ? model : "",
-			"whisper-1",
-			"gpt-4o-mini-transcribe",
-			"gpt-4o-transcribe",
-			looksLikeSttModel(profile.defaultModel) ? profile.defaultModel : "",
-			model,
-			profile.defaultModel,
-			...profile.models.filter(looksLikeSttModel),
+			primary,
+			// light aliases only when primary is empty or clearly generic
+			!primary || primary === profile.defaultModel
+				? "whisper-1"
+				: "",
 		]);
 
 		const fieldStrategies: Array<{
@@ -47,15 +47,16 @@ export class VoiceService {
 				fieldName: "file",
 				extra: { response_format: "json" },
 			},
+			// second strategy only if first fails with non-model error
 			{
 				fieldName: "file",
 				extra: { language: "zh", response_format: "json" },
 			},
-			{ fieldName: "audio", extra: {} },
 		];
 
 		const errors: string[] = [];
 		for (const m of modelsToTry) {
+			let modelInvalid = false;
 			for (let si = 0; si < fieldStrategies.length; si++) {
 				const strat = fieldStrategies[si]!;
 				const res = await requestMultipart({
@@ -79,16 +80,25 @@ export class VoiceService {
 					if (
 						/model|not found|does not exist|invalid model/i.test(res.error)
 					) {
+						modelInvalid = true;
 						break; // next model
 					}
+					// for primary model, try one more field strategy then stop model
 					continue;
 				}
-				const content = extractTranscript(res.data);
+				let content = extractTranscript(res.data);
+					if (!content?.trim() && res.text) {
+						content = extractTranscript(res.text);
+					}
 				if (!content?.trim()) {
 					errors.push(`model=${m} s${si}: 响应无 text`);
 					continue;
 				}
 				return { ok: true, text: content.trim() };
+			}
+			if (modelInvalid && m === primary && modelsToTry.length === 1) {
+				// optional single alias retry
+				continue;
 			}
 		}
 
@@ -151,15 +161,72 @@ function looksLikeSttModel(m: string | null | undefined): boolean {
 }
 
 function extractTranscript(data: unknown): string | null {
-	if (!data || typeof data !== "object") return null;
-	const text = (data as { text?: unknown }).text;
-	if (typeof text === "string" && text.trim()) return text;
-	const nested = (data as { data?: { text?: unknown } }).data?.text;
-	if (typeof nested === "string" && nested.trim()) return nested;
-	const segs = (data as { segments?: Array<{ text?: string }> }).segments;
+	if (data == null) return null;
+	if (typeof data === "string" && data.trim()) {
+		const s = data.trim();
+		if (s.startsWith("{") || s.startsWith("[")) {
+			try {
+				return extractTranscript(JSON.parse(s));
+			} catch {
+				return s;
+			}
+		}
+		return s;
+	}
+	if (typeof data !== "object") return null;
+	const o = data as Record<string, unknown>;
+
+	if (typeof o.text === "string" && o.text.trim()) return o.text.trim();
+	for (const k of ["result", "transcript", "transcription", "content"]) {
+		const v = o[k];
+		if (typeof v === "string" && v.trim()) return v.trim();
+	}
+	if (o.data != null) {
+		const nested = extractTranscript(o.data);
+		if (nested) return nested;
+	}
+	// Xiaomi / DashScope-style
+	if (o.output != null && typeof o.output === "object") {
+		const out = o.output as Record<string, unknown>;
+		if (typeof out.text === "string" && out.text.trim()) return out.text.trim();
+		if (typeof out.sentence === "string" && out.sentence.trim()) {
+			return out.sentence.trim();
+		}
+		if (Array.isArray(out.sentences)) {
+			const joined = out.sentences
+				.map((s) =>
+					s && typeof s === "object"
+						? String((s as { text?: string }).text || "")
+						: String(s || ""),
+				)
+				.join("")
+				.trim();
+			if (joined) return joined;
+		}
+		const nestedOut = extractTranscript(out);
+		if (nestedOut) return nestedOut;
+	}
+	const segs = o.segments;
 	if (Array.isArray(segs)) {
-		const joined = segs.map((s) => s.text || "").join("").trim();
+		const joined = segs
+			.map((s) =>
+				s && typeof s === "object"
+					? String((s as { text?: string }).text || "")
+					: "",
+			)
+			.join("")
+			.trim();
 		if (joined) return joined;
+	}
+	const choices = o.choices;
+	if (Array.isArray(choices) && choices[0] && typeof choices[0] === "object") {
+		const c0 = choices[0] as Record<string, unknown>;
+		if (typeof c0.text === "string" && c0.text.trim()) return c0.text.trim();
+		const msg = c0.message;
+		if (msg && typeof msg === "object") {
+			const content = (msg as { content?: unknown }).content;
+			if (typeof content === "string" && content.trim()) return content.trim();
+		}
 	}
 	return null;
 }

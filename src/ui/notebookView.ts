@@ -203,9 +203,6 @@ export class NotebookView extends ItemView {
 			new CreateNotebookModal(this.app, this.plugin, () => undefined).open();
 		});
 
-		const captureBtn = toolbar.createEl("button", { text: "快速捕获" });
-		captureBtn.addEventListener("click", () => void this.quickCapture());
-
 		const refreshBtn = toolbar.createEl("button", { text: "刷新" });
 		refreshBtn.addEventListener("click", () => void this.reload());
 
@@ -517,24 +514,16 @@ export class NotebookView extends ItemView {
 			new Notice("未打开记录本");
 			return;
 		}
-		const resolved =
-			this.plugin.resolveAi("voice", this.meta) ||
-			this.plugin.resolveAi("worker", this.meta) ||
-			this.plugin.resolveAi("planner", this.meta);
-		if (!resolved) {
-			new Notice("请先配置 AI Provider（语音转写需要 API）");
-			return;
-		}
-		await this.recordAndTranscribe(resolved.profile, resolved.model);
+		// 无 AI 也可录音：至少保存可播放的音频笔记
+		await this.recordAndTranscribe();
 	}
 
-
-	private async recordAndTranscribe(
-		profile: import("../domain/types").ProviderProfile,
-		model: string,
-	): Promise<void> {
+	private async recordAndTranscribe(): Promise<void> {
 		if (!this.meta) return;
-		const modal = new VoiceRecordModal(this.app);
+		const modal = new VoiceRecordModal(
+			this.app,
+			this.plugin.settings.voice?.recordFormat ?? "auto",
+		);
 		const recorded = await modal.waitForResult();
 		if (!recorded.ok) {
 			if (recorded.cancelled) return;
@@ -551,64 +540,308 @@ export class NotebookView extends ItemView {
 			return;
 		}
 
-		new Notice(
-			`录音完成 ${Math.round(recorded.blob.size / 1024)}KB：先存音频文件，再转写…`,
-		);
+		const kb = Math.round(recorded.blob.size / 1024);
+		const title = `语音 ${new Date().toLocaleString()}`;
+		const chip = this.showVoiceProgressChip(`录音 ${kb}KB · 保存中…`);
 
-		// New pipeline: save file → whisper STT → chat model listens to audio
+		let vaultPath: string;
+		let arrayBuffer: ArrayBuffer;
+		let embedMarkdown: string;
+		try {
+			const saved = await this.plugin.voicePipeline.saveAudioFile(
+				this.meta,
+				recorded.blob,
+				recorded.filename || "audio.wav",
+			);
+			vaultPath = saved.vaultPath;
+			arrayBuffer = saved.arrayBuffer;
+			const { buildEmbedMarkdown } = await import(
+				"../services/voicePipeline"
+			);
+			embedMarkdown = buildEmbedMarkdown(vaultPath);
+		} catch (e) {
+			chip.done(
+				`保存失败：${e instanceof Error ? e.message : String(e)}`,
+				false,
+			);
+			return;
+		}
+
+		// Keep note body stable — progress only in corner chip
+		const pendingBody = [
+			"## 转写",
+			"",
+			"> ⏳ 转写处理中…（进度见进度浮条）",
+			"",
+			embedMarkdown,
+		].join("\n");
+
+		let pendingItem: import("../domain/types").NotebookItem | null = null;
+		try {
+			if (!this.blueprint) {
+				const { blueprint } = await this.plugin.versions.loadCurrentBlueprint(
+					this.meta.folderName,
+				);
+				this.blueprint = blueprint;
+				this.plugin.runtime.load(blueprint);
+			}
+			pendingItem = await this.plugin.items.createItem(this.meta, {
+				title,
+				body: pendingBody,
+				entityType: this.plugin.runtime.primaryEntityId() ?? undefined,
+				fields: {
+					source: "voice",
+					transcribe_status: "pending",
+					audio_path: vaultPath,
+				},
+			});
+			this.activeItem = pendingItem;
+			this.leftTab = "items";
+			await this.reload();
+			chip.set("已写入笔记 · 转写中…");
+		} catch (e) {
+			chip.done(
+				`笔记创建失败（音频已在附件）：${e instanceof Error ? e.message : String(e)}`,
+				false,
+			);
+		}
+
+		let lastChip = "";
 		const pipe = await this.plugin.voicePipeline.process(
 			this.meta,
 			recorded.blob,
 			recorded.filename || "audio.wav",
+			{
+				existing: { vaultPath, arrayBuffer },
+				onProgress: (msg) => {
+					if (msg !== lastChip) {
+						lastChip = msg;
+						chip.set(msg);
+					}
+				},
+			},
 		);
 
 		if (pipe.ok && pipe.transcript.trim()) {
 			const methodLabel =
 				pipe.method === "whisper"
-					? "Whisper 转写"
+					? "STT"
 					: pipe.method === "chat-audio"
-						? "对话模型听音频"
+						? "听音频"
 						: "转写";
-			const body = `${pipe.transcript.trim()}${pipe.embedMarkdown}`;
-			await this.createFromTranscript(body, {
-				sourceLabel: "voice",
-				title:
-					pipe.transcript.trim().split(/\n/)[0]?.slice(0, 40) ||
-					`语音 ${new Date().toLocaleString()}`,
-			});
-			new Notice(`已保存笔记（${methodLabel}）`);
+			const raw = pipe.transcript.trim();
+			const polished = (pipe.polished || "").trim();
+			const parts = ["## 转写", "", raw];
+			if (polished && polished !== raw) {
+				parts.push("", "## 润色", "", polished);
+			}
+			parts.push(pipe.embedMarkdown || embedMarkdown);
+			const body = parts.join("\n");
+			const titleSrc = polished || raw;
+			const titleLine =
+				titleSrc
+					.split("\n")
+					.find((l) => l.trim() && !l.startsWith("#"))
+					?.slice(0, 40) || title;
+			try {
+				if (pendingItem) {
+					const updated = await this.plugin.items.updateItem(pendingItem, {
+						title: titleLine,
+						body,
+						fields: {
+							source: "voice",
+							transcribe_status: "done",
+							audio_path: vaultPath,
+						},
+					});
+					this.activeItem = updated;
+					await this.reload();
+				} else {
+					await this.createFromTranscript(body, {
+						sourceLabel: "voice",
+						title: titleLine,
+						preserveEmbedsFrom: body,
+					});
+				}
+			} catch (e) {
+				chip.done(
+					`写回失败：${e instanceof Error ? e.message : String(e)}`,
+					false,
+				);
+				return;
+			}
+			chip.done(
+				polished && polished !== raw
+					? `完成 · ${methodLabel}+润色`
+					: `完成 · ${methodLabel}`,
+				true,
+			);
 			return;
 		}
 
-		// Failed STT but audio is on disk — still create note with player embed
 		const draft = [
-			"【语音已保存；自动转写未成功】",
+			"## 转写",
 			"",
-			pipe.error || "未知错误",
+			pipe.error
+				? `> 自动转写未成功：${pipe.error}`
+				: "> 自动转写未成功。",
+			pipe.errorDetail
+				? `\n> 详情：${pipe.errorDetail.replace(/\n/g, " · ").slice(0, 280)}\n`
+				: "",
 			"",
-			"说明：",
-			"- 录音文件已写入附件目录，下方可直接播放。",
-			"- 当前中转若无 whisper 渠道，可：①另配支持 /audio/transcriptions 的服务商并绑定「语音转写」；",
-			"  ②或使用支持「听音频」的多模态对话模型（插件会把音频发给对话接口尝试转写）。",
-			"",
-			"（也可手动把听到的内容写在本段下方）",
-			pipe.embedMarkdown,
-		].join("\n");
-		await this.createFromTranscript(draft, {
-			title: `语音 ${new Date().toLocaleString()}`,
-			skipAi: true,
-			sourceLabel: "voice-audio-only",
+			"下方可直接播放录音；也可手动把听到的内容写在本段下方。",
+			pipe.embedMarkdown || embedMarkdown,
+		]
+			.filter((line) => line !== "")
+			.join("\n");
+		try {
+			if (pendingItem) {
+				const updated = await this.plugin.items.updateItem(pendingItem, {
+					body: draft,
+					fields: {
+						source: "voice",
+						transcribe_status: "failed",
+						audio_path: vaultPath,
+					},
+				});
+				this.activeItem = updated;
+				await this.reload();
+			} else {
+				await this.createFromTranscript(draft, {
+					title,
+					skipAi: true,
+					sourceLabel: "voice-audio-only",
+					preserveEmbedsFrom: draft,
+				});
+			}
+		} catch {
+			/* ignore */
+		}
+		const detail = (pipe.errorDetail || pipe.error || "").slice(0, 90);
+		chip.done(`失败 · ${detail || "见笔记"}`, false);
+	}
+
+	/** Draggable voice progress chip; position saved in settings. */
+	private showVoiceProgressChip(initial: string): {
+		set: (msg: string) => void;
+		done: (msg: string, ok: boolean) => void;
+	} {
+		document.querySelector(".ai-notebook-voice-chip")?.remove();
+		const el = document.body.createDiv({
+			cls: "ai-notebook-voice-chip is-busy",
 		});
-		new Notice(
-			pipe.vaultPath
-				? `音频已保存；转写失败：${(pipe.error || "").slice(0, 60)}`
-				: `处理失败：${pipe.error}`,
-		);
+		el.createSpan({ cls: "ai-notebook-voice-chip-dot" });
+		const text = el.createSpan({
+			cls: "ai-notebook-voice-chip-text",
+			text: initial,
+		});
+		
+		const saved = this.plugin.settings.voice?.chipPosition;
+		const place = () => {
+			const w = el.offsetWidth || 200;
+			const h = el.offsetHeight || 36;
+			const maxL = Math.max(8, window.innerWidth - w - 8);
+			const maxT = Math.max(8, window.innerHeight - h - 8);
+			if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) {
+				el.style.left = Math.min(maxL, Math.max(8, saved.left)) + "px";
+				el.style.top = Math.min(maxT, Math.max(8, saved.top)) + "px";
+				el.style.right = "auto";
+				el.style.bottom = "auto";
+			} else {
+				el.style.right = "16px";
+				el.style.bottom = "18px";
+				el.style.left = "auto";
+				el.style.top = "auto";
+			}
+		};
+		place();
+		
+		let dragging = false;
+		let moved = false;
+		let startX = 0;
+		let startY = 0;
+		let origL = 0;
+		let origT = 0;
+		
+		const onDown = (clientX: number, clientY: number) => {
+			dragging = true;
+			moved = false;
+			const rect = el.getBoundingClientRect();
+			origL = rect.left;
+			origT = rect.top;
+			startX = clientX;
+			startY = clientY;
+			el.style.left = origL + "px";
+			el.style.top = origT + "px";
+			el.style.right = "auto";
+			el.style.bottom = "auto";
+			el.addClass("is-dragging");
+		};
+		const onMove = (clientX: number, clientY: number) => {
+			if (!dragging) return;
+			const dx = clientX - startX;
+			const dy = clientY - startY;
+			if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+			const w = el.offsetWidth;
+			const h = el.offsetHeight;
+			const left = Math.min(Math.max(8, origL + dx), Math.max(8, window.innerWidth - w - 8));
+			const top = Math.min(Math.max(8, origT + dy), Math.max(8, window.innerHeight - h - 8));
+			el.style.left = left + "px";
+			el.style.top = top + "px";
+		};
+		const onUp = () => {
+			if (!dragging) return;
+			dragging = false;
+			el.removeClass("is-dragging");
+			if (!moved) return;
+			const rect = el.getBoundingClientRect();
+			const pos = { left: Math.round(rect.left), top: Math.round(rect.top) };
+			this.plugin.settings = {
+				...this.plugin.settings,
+				voice: {
+					...this.plugin.settings.voice,
+					chipPosition: pos,
+				},
+			};
+			void this.plugin.saveSettings();
+		};
+		
+		el.addEventListener("pointerdown", (ev) => {
+			if (ev.button != null && ev.button !== 0) return;
+			ev.preventDefault();
+			el.setPointerCapture(ev.pointerId);
+			onDown(ev.clientX, ev.clientY);
+		});
+		el.addEventListener("pointermove", (ev) => {
+			onMove(ev.clientX, ev.clientY);
+		});
+		el.addEventListener("pointerup", () => onUp());
+		el.addEventListener("pointercancel", () => onUp());
+		
+		return {
+			set: (msg: string) => {
+				text.setText(msg);
+				el.removeClass("is-ok");
+				el.removeClass("is-err");
+				el.addClass("is-busy");
+			},
+			done: (msg: string, ok: boolean) => {
+				text.setText(msg);
+				el.removeClass("is-busy");
+				el.addClass(ok ? "is-ok" : "is-err");
+				window.setTimeout(() => el.remove(), ok ? 2800 : 5600);
+			},
+		};
 	}
 
 	private async createFromTranscript(
 		text: string,
-		opts?: { title?: string; skipAi?: boolean; sourceLabel?: string },
+		opts?: {
+			title?: string;
+			skipAi?: boolean;
+			sourceLabel?: string;
+			preserveEmbedsFrom?: string;
+		},
 	): Promise<void> {
 		if (!this.meta) {
 			new Notice("未打开记录本，无法保存");
@@ -657,6 +890,7 @@ export class NotebookView extends ItemView {
 					source: opts?.sourceLabel || "voice",
 					sourceHint: "语音转写",
 					entityType: this.plugin.runtime.primaryEntityId() ?? undefined,
+					preserveEmbedsFrom: opts?.preserveEmbedsFrom || text,
 				},
 			);
 
@@ -1630,19 +1864,22 @@ export class NotebookView extends ItemView {
 		const modes = this.plugin.runtime.availableItemViewModes();
 
 		const controls = listPane.createDiv({ cls: "ai-notebook-list-controls" });
-		const modeBar = controls.createDiv({ cls: "ai-notebook-view-mode-bar" });
-		const labels: Record<"list" | "table" | "board", string> = {
-			list: "列表",
-			table: "表格",
-			board: "看板",
-		};
-		for (const mode of modes) {
-			const btn = modeBar.createEl("button", { text: labels[mode] });
-			btn.toggleClass("mod-cta", this.itemViewMode === mode);
-			btn.addEventListener("click", () => {
-				this.itemViewMode = mode;
-				this.render();
-			});
+		// Only show mode switch when multiple views exist; a lone「列表」label is noise.
+		if (modes.length > 1) {
+			const modeBar = controls.createDiv({ cls: "ai-notebook-view-mode-bar" });
+			const labels: Record<"list" | "table" | "board", string> = {
+				list: "列表",
+				table: "表格",
+				board: "看板",
+			};
+			for (const mode of modes) {
+				const btn = modeBar.createEl("button", { text: labels[mode] });
+				btn.toggleClass("mod-cta", this.itemViewMode === mode);
+				btn.addEventListener("click", () => {
+					this.itemViewMode = mode;
+					this.render();
+				});
+			}
 		}
 
 		const filterFields = this.plugin.runtime.filterFields(entityId);
@@ -1689,7 +1926,7 @@ export class NotebookView extends ItemView {
 		if (this.items.length === 0) {
 			listPane.createDiv({
 				cls: "ai-notebook-empty",
-				text: "暂无条目，点击「快速捕获」开始。",
+				text: "暂无条目。可用「语音录入」、浮层助手或手机入口创建。",
 			});
 			return;
 		}
@@ -1814,35 +2051,6 @@ export class NotebookView extends ItemView {
 		}
 	}
 
-	async quickCapture(): Promise<void> {
-		if (!this.meta || !this.blueprint) return;
-		const title = window.prompt("条目标题", "未命名");
-		if (title == null) return;
-		try {
-			const entityType = this.plugin.runtime.primaryEntityId() ?? undefined;
-			const item = await this.plugin.items.createItem(this.meta, {
-				title,
-				entityType,
-			});
-			const hooked = await this.plugin.hooks.runOnCreate({
-				meta: this.meta,
-				item,
-				blueprint: this.blueprint,
-			});
-			this.activeItem = hooked.item;
-			const failed = hooked.steps.filter((s) => !s.ok);
-			if (failed.length) {
-				new Notice(
-					`已创建；部分钩子失败: ${failed.map((f) => f.type).join(", ")}`,
-				);
-			} else if (!hooked.steps.some((s) => s.type === "notify")) {
-				new Notice("已创建条目");
-			}
-			await this.reload();
-		} catch (e) {
-			new Notice(`创建失败: ${e instanceof Error ? e.message : String(e)}`);
-		}
-	}
 
 	private async renderCabinet(
 		listPane: HTMLElement,

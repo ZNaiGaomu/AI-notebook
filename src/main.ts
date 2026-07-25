@@ -10,7 +10,10 @@ import { VersionService } from "./services/versionService";
 import { NotebookService } from "./services/notebookService";
 import { ItemService } from "./services/itemService";
 import { FeatureOrchestrator } from "./services/featureOrchestrator";
-import { resolveProvider } from "./services/providerResolver";
+import {
+	resolveProvider,
+	resolveProviderChain,
+} from "./services/providerResolver";
 import { CabinetService } from "./services/cabinetService";
 import { VoiceService } from "./services/voiceService";
 import { VoicePipeline } from "./services/voicePipeline";
@@ -67,8 +70,8 @@ export default class AiNotebookPlugin extends Plugin {
 		}
 
 		this.packageArchive = new PluginPackageArchive(this);
-		// Keep a local copy of the running package for one-click switch later.
-		void this.packageArchive.archiveCurrentPackage().catch(() => undefined);
+		// Auto-backup only when this version has no local snapshot yet (avoid redundant rewrites).
+		void this.packageArchive.archiveCurrentPackageIfNeeded().catch(() => undefined);
 
 		this.vaultIo = new VaultIo(this.app);
 		this.versions = new VersionService(this.vaultIo, () => this.settings);
@@ -91,7 +94,8 @@ export default class AiNotebookPlugin extends Plugin {
 			this.voice,
 			this.gateway,
 			() => this.settings,
-			(purpose, notebook) => resolveProvider(this.settings, purpose, notebook),
+			(purpose, notebook) =>
+				resolveProviderChain(this.settings, purpose, notebook),
 		);
 		this.features = new FeatureOrchestrator(
 			this.gateway,
@@ -205,14 +209,6 @@ export default class AiNotebookPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "quick-capture-ai-notebook",
-			name: "快速捕获（当前记录本）",
-			callback: () => {
-				void this.quickCaptureInOpenView();
-			},
-		});
-
-		this.addCommand({
 			id: "modify-features-by-description",
 			name: "用语言改功能",
 			callback: () => {
@@ -270,6 +266,7 @@ export default class AiNotebookPlugin extends Plugin {
 			},
 		});
 
+
 		this.addCommand({
 			id: "show-mobile-web-link",
 			name: "显示手机网页入口链接",
@@ -304,7 +301,15 @@ export default class AiNotebookPlugin extends Plugin {
 			},
 		});
 
-		this.addSettingTab(new AiNotebookSettingTab(this.app, this));
+		
+		// Keep notebook display name in sync when user renames folder in file explorer
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				void this.onVaultPathRenamed(file.path, oldPath);
+			}),
+		);
+
+this.addSettingTab(new AiNotebookSettingTab(this.app, this));
 
 		// Ensure mobile drop folder exists on load (non-blocking)
 		void this.inbox.ensureStructure().catch(() => undefined);
@@ -315,6 +320,39 @@ export default class AiNotebookPlugin extends Plugin {
 			this.settings.bridge.autoStart
 		) {
 			void this.startMobileBridge().catch(() => undefined);
+		}
+	}
+
+	private async onVaultPathRenamed(
+		newPath: string,
+		oldPath: string,
+	): Promise<void> {
+		const rootRaw = this.settings.paths.notebooksRoot || "AI Notebooks";
+		const root = rootRaw.replace(/\\/g, "/").replace(/\/+$/, "");
+		const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "");
+		const op = norm(oldPath);
+		const np = norm(newPath);
+		const prefix = root + "/";
+		if (!op.startsWith(prefix) || !np.startsWith(prefix)) return;
+		const oldParts = op.slice(prefix.length).split("/").filter(Boolean);
+		const newParts = np.slice(prefix.length).split("/").filter(Boolean);
+		const oldFolder = oldParts[0] || "";
+		const newFolder = newParts[0] || "";
+		if (!oldFolder || !newFolder || oldFolder === newFolder) return;
+		// Notebook folder rename: top-level segment under notebooks root changed
+		const meta = await this.notebooks.syncAfterFolderRename(
+			oldFolder,
+			newFolder,
+		);
+		if (!meta) {
+			await this.notebooks.alignNameToFolder(newFolder);
+		}
+		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_AI_NOTEBOOK);
+		for (const leaf of leaves) {
+			const view = leaf.view;
+			if (view instanceof NotebookView) {
+				await view.reload();
+			}
 		}
 	}
 
@@ -586,16 +624,6 @@ export default class AiNotebookPlugin extends Plugin {
 		return leaf;
 	}
 
-	private async quickCaptureInOpenView(): Promise<void> {
-		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_AI_NOTEBOOK);
-		const view = leaves[0]?.view;
-		if (view instanceof NotebookView) {
-			await view.quickCapture();
-			return;
-		}
-		new Notice("请先打开 AI 记录本视图");
-	}
-
 	private async runFeatureEditCommand(): Promise<void> {
 		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_AI_NOTEBOOK);
 		const view = leaves[0]?.view;
@@ -658,6 +686,7 @@ export default class AiNotebookPlugin extends Plugin {
 			this.gateway,
 			() => this.settings,
 			(purpose) => resolveProvider(this.settings, purpose, null),
+			(purpose) => resolveProviderChain(this.settings, purpose, null),
 		);
 		const lines = await diag.run();
 		const text = lines
@@ -701,6 +730,72 @@ export default class AiNotebookPlugin extends Plugin {
 				`诊断完成（写笔记失败）: ${lines.map((l) => l.step + (l.ok ? "✓" : "✗")).join(" ")}`,
 			);
 			console.error(e);
+		}
+	}
+
+	private async diagnoseAllVoiceModels(): Promise<void> {
+		new Notice("开始全量体检（所有服务商×模型，可能较久）…", 5000);
+		const diag = new VoiceDiagnostics(
+			this.app,
+			this.voice,
+			this.gateway,
+			() => this.settings,
+			(purpose) => resolveProvider(this.settings, purpose, null),
+			(purpose) => resolveProviderChain(this.settings, purpose, null),
+		);
+		const { lines, sttOk, chatOk } = await diag.runFullCatalog({
+			onProgress: (msg) => {
+				console.info("[ai-notebook voice full]", msg);
+			},
+		});
+		const text = lines
+			.map((l) => {
+				const mark = l.ok ? "[OK] " : "[X] ";
+				return mark + l.step + "\n   " + l.detail;
+			})
+			.join("\n\n");
+		console.info("[ai-notebook voice full diag]\n" + text);
+		try {
+			await this.inbox.ensureStructure();
+			const path = `${this.settings.paths.inboxRoot}/语音能力全量体检.md`;
+			const sttList = sttOk.length
+				? sttOk.map((s) => "- " + s).join("\n")
+				: "- （无）";
+			const chatList = chatOk.length
+				? chatOk.map((s) => "- " + s).join("\n")
+				: "- （无）";
+			const body =
+				"# 语音能力全量体检\n\n" +
+				"时间：" +
+				new Date().toLocaleString() +
+				"\n\n## 摘要\n\n" +
+				"- STT 可用 " +
+				String(sttOk.length) +
+				" 个\n" +
+				"- 听音频可用 " +
+				String(chatOk.length) +
+				" 个\n\n" +
+				"### STT 可用列表\n\n" +
+				sttList +
+				"\n\n### 听音频可用列表\n\n" +
+				chatList +
+				"\n\n## 明细\n\n" +
+				text +
+				"\n";
+			await this.vaultIo.write(path, body);
+			new Notice(
+				"全量体检完成：STT " +
+					String(sttOk.length) +
+					" / 听音频 " +
+					String(chatOk.length) +
+					" · 见 AI Inbox/语音能力全量体检",
+				8000,
+			);
+		} catch (e) {
+			new Notice(
+				"体检完成但写笔记失败：" +
+					(e instanceof Error ? e.message : String(e)),
+			);
 		}
 	}
 

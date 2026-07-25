@@ -163,6 +163,49 @@ export const PLUGIN_CAPABILITY_LOG: PluginCapabilityEntry[] = [
 		releasedAt: "2026-07-21",
 		category: "history",
 	},
+	{
+		id: "cap-0.2.0-float-assistant",
+		pluginVersion: "0.2.0",
+		title: "浮层助手真写入与多模型回退",
+		summary: "可拖拽浮层对话；助手改正文/字段/嵌媒体；规划/助手/语音有序回退",
+		details: [
+			"浮层助手：收放、尺寸记忆、排队/引导、本轮附件隔离",
+			"结构化动作：update_item / create_item / embed_in_body",
+			"拖拽粘贴上传；对话附件落盘与历史附件管理",
+			"按条目会话历史；用途级多模型链 1→2→3",
+		],
+		releasedAt: "2026-07-24",
+		category: "ui",
+	},
+	{
+		id: "cap-0.3.0-package-sources",
+		pluginVersion: "0.3.0",
+		title: "GitHub 多来源安装包 + 本地备份切换",
+		summary: "多行 GitHub 来源按需拉取 Tags/Release/Code ZIP；本地备份列表一键切换；不改笔记",
+		details: [
+			"插件整体历史：仿 AI 服务商一行一个 GitHub 来源",
+			"拉取回退：Tags 页面 → jsDelivr → Release API → Tags API → 默认分支 Code ZIP",
+			"下载优先 github.com/.../archive/refs/tags/vX.Y.Z.zip；失败再 raw/jsDelivr 三文件",
+			"按来源分目录 package-archive/by-source/{id}/vX.Y.Z/（同号不同源隔离）",
+			"本地运行备份列表可切换；启动同版本已存在则跳过自动备份",
+			"本内历史说明挂钩「另存蓝图版本」；单视图隐藏「列表」标签；移除快速捕获",
+		],
+		releasedAt: "2026-07-25",
+		category: "history",
+	},
+	{
+		id: "cap-0.3.0-voice-routing",
+		pluginVersion: "0.3.0",
+		title: "语音流水线与用途路由增强",
+		summary: "录音格式协商、STT 多模型 fan-out、转写后润色、诊断与 WAV 转码",
+		details: [
+			"voice 用途链 + modelFanout；transcriptions 失败可 chat 听音频回退",
+			"可选转码 16k mono WAV；润色 prompt 可配置",
+			"语音诊断命令；进度芯片位置记忆",
+		],
+		releasedAt: "2026-07-25",
+		category: "voice",
+	},
 ];
 
 export function listPluginCapabilitiesNewestFirst(): PluginCapabilityEntry[] {
