@@ -694,6 +694,24 @@
 	border-top: 1px solid var(--background-modifier-border);
 }
 
+.ai-notebook-create-modal .ai-notebook-create-name {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	margin: 12px 0 16px;
+}
+
+.ai-notebook-create-modal .ai-notebook-create-name label {
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+.ai-notebook-create-modal .ai-notebook-create-name input {
+	width: 100%;
+	box-sizing: border-box;
+	pointer-events: auto;
+}
+
 .ai-notebook-create-modal .template-grid {
 	display: grid;
 	grid-template-columns: 1fr 1fr;
@@ -722,6 +740,12 @@
 	margin: 0;
 	font-size: 0.8em;
 	color: var(--text-muted);
+}
+
+.ai-notebook-create-modal .ai-notebook-create-actions {
+	display: flex;
+	justify-content: flex-end;
+	margin-top: 12px;
 }
 
 /* —— Item list controls / table / board —— */

@@ -25,11 +25,13 @@ export class ItemService {
 	async listItems(meta: NotebookMeta): Promise<NotebookItem[]> {
 		const settings = this.getSettings();
 		const dir = itemsDir(settings, meta.folderName);
-		const files = this.vault
+		const files = this.vault.listFilesInFolder(dir);
+		await this.ensureManualFilesImported(meta, files);
+		const refreshedFiles = this.vault
 			.listFilesInFolder(dir)
 			.filter((f) => f.extension === "md");
 		const items: NotebookItem[] = [];
-		for (const file of files) {
+		for (const file of refreshedFiles) {
 			try {
 				const content = await this.vault.read(file.path);
 				const { frontmatter, body } = parseFrontmatter(content);
@@ -151,6 +153,167 @@ export class ItemService {
 		await this.vault.move(item.path, target);
 	}
 
+	private async ensureManualFilesImported(
+		meta: NotebookMeta,
+		files: Array<{ path: string; extension: string }>,
+	): Promise<void> {
+		const settings = this.getSettings();
+		const dir = itemsDir(settings, meta.folderName).replace(/\/+$/, "");
+		const directFiles = files.filter((file) => isDirectChild(dir, file.path));
+		const markdownFiles = directFiles.filter(
+			(file) => normalizeExtension(file.extension) === "md",
+		);
+		const wrappedSourcePaths = await this.collectWrappedSourcePaths(markdownFiles);
+
+		for (const file of markdownFiles) {
+			try {
+				await this.upgradeMarkdownFile(meta, file.path);
+			} catch {
+				// leave user file untouched if import fails
+			}
+		}
+
+		for (const file of directFiles) {
+			if (normalizeExtension(file.extension) === "md") continue;
+			if (wrappedSourcePaths.has(file.path)) continue;
+			try {
+				await this.createWrapperForFile(
+					meta,
+					file.path,
+					normalizeExtension(file.extension),
+					markdownFiles,
+				);
+			} catch {
+				// leave user file untouched if wrapper creation fails
+			}
+		}
+	}
+
+	private async collectWrappedSourcePaths(
+		markdownFiles: Array<{ path: string }>,
+	): Promise<Set<string>> {
+		const wrapped = new Set<string>();
+		for (const file of markdownFiles) {
+			try {
+				const { frontmatter } = parseFrontmatter(await this.vault.read(file.path));
+				const source = frontmatter.source_file_path;
+				if (typeof source === "string" && source.trim()) {
+					wrapped.add(source.trim());
+				}
+			} catch {
+				// ignore unreadable wrapper candidates
+			}
+		}
+		return wrapped;
+	}
+
+	private async upgradeMarkdownFile(
+		meta: NotebookMeta,
+		path: string,
+	): Promise<void> {
+		const content = await this.vault.read(path);
+		const { frontmatter, body } = parseFrontmatter(content);
+		if (
+			frontmatter.ai_notebook === true &&
+			String(frontmatter.notebook_id) === meta.notebook_id
+		) {
+			return;
+		}
+		if (
+			frontmatter.ai_notebook === true &&
+			frontmatter.notebook_id != null &&
+			String(frontmatter.notebook_id) !== meta.notebook_id
+		) {
+			return;
+		}
+
+		const { blueprint } = await this.versions.loadCurrentBlueprint(meta.folderName);
+		const entityType = this.defaultEntityType(blueprint);
+		const now = nowIso();
+		const title = titleFromFrontmatterBodyOrPath(frontmatter.title, body, path);
+		const nextFm: ItemFrontmatter = coerceFrontmatter(
+			{
+				...frontmatter,
+				ai_notebook: true,
+				notebook_id: meta.notebook_id,
+				item_id:
+					typeof frontmatter.item_id === "string" && frontmatter.item_id.trim()
+						? frontmatter.item_id
+						: createId(),
+				schema_version:
+					typeof frontmatter.schema_version === "number"
+						? frontmatter.schema_version
+						: blueprint.blueprintVersion,
+				entity_type:
+					typeof frontmatter.entity_type === "string" &&
+					frontmatter.entity_type.trim()
+						? frontmatter.entity_type
+						: entityType,
+				title,
+				tags: asStringArray(frontmatter.tags),
+				cabinet_refs: asStringArray(frontmatter.cabinet_refs),
+				created:
+					typeof frontmatter.created === "string" && frontmatter.created.trim()
+						? frontmatter.created
+						: now,
+				updated: now,
+			},
+			meta.notebook_id,
+		);
+		await this.vault.write(path, serializeFrontmatter(nextFm, body));
+	}
+
+	private async createWrapperForFile(
+		meta: NotebookMeta,
+		sourcePath: string,
+		extension: string,
+		markdownFiles: Array<{ path: string }>,
+	): Promise<void> {
+		const base = baseNameWithoutExtension(sourcePath);
+		const wrapperPath = await this.nextWrapperPath(sourcePath, markdownFiles);
+		const body = [
+			`![[${sourcePath}]]`,
+			"",
+			`文件：\`${sourcePath}\``,
+			`类型：${extension || "file"}`,
+			"",
+			"此条目由 AI 记录本从 items 文件夹内的非 Markdown 文件自动生成。",
+		].join("\n");
+		const now = nowIso();
+		const { blueprint } = await this.versions.loadCurrentBlueprint(meta.folderName);
+		const fm: ItemFrontmatter = {
+			ai_notebook: true,
+			notebook_id: meta.notebook_id,
+			item_id: createId(),
+			schema_version: blueprint.blueprintVersion,
+			entity_type: this.defaultEntityType(blueprint),
+			title: base,
+			tags: [],
+			cabinet_refs: [],
+			created: now,
+			updated: now,
+			source_file_path: sourcePath,
+			source_file_type: extension || "file",
+		};
+		await this.vault.write(wrapperPath, serializeFrontmatter(fm, body));
+	}
+
+	private async nextWrapperPath(
+		sourcePath: string,
+		markdownFiles: Array<{ path: string }>,
+	): Promise<string> {
+		const dir = sourcePath.slice(0, sourcePath.lastIndexOf("/"));
+		const base = sanitizeFileStem(baseNameWithoutExtension(sourcePath));
+		const used = new Set(markdownFiles.map((file) => file.path));
+		let candidate = `${dir}/${base}.md`;
+		let n = 2;
+		while (used.has(candidate) || (await this.vault.exists(candidate))) {
+			candidate = `${dir}/${base}-${n}.md`;
+			n++;
+		}
+		return candidate;
+	}
+
 	defaultEntityType(blueprint: Blueprint): string {
 		return blueprint.entityTypes[0]?.id ?? "note";
 	}
@@ -173,6 +336,42 @@ function coerceFrontmatter(
 		created: String(raw.created ?? ""),
 		updated: String(raw.updated ?? ""),
 	};
+}
+
+function isDirectChild(folder: string, path: string): boolean {
+	const normalizedFolder = folder.replace(/\/+$/, "");
+	const normalizedPath = path.replace(/\\/g, "/");
+	if (!normalizedPath.startsWith(`${normalizedFolder}/`)) return false;
+	const rest = normalizedPath.slice(normalizedFolder.length + 1);
+	return Boolean(rest) && !rest.includes("/");
+}
+
+function titleFromFrontmatterBodyOrPath(
+	rawTitle: unknown,
+	body: string,
+	path: string,
+): string {
+	if (typeof rawTitle === "string" && rawTitle.trim()) {
+		return rawTitle.trim();
+	}
+	const heading = body.match(/^\s*#\s+(.+)$/m)?.[1]?.trim();
+	if (heading) return heading;
+	return baseNameWithoutExtension(path) || "未命名";
+}
+
+function baseNameWithoutExtension(path: string): string {
+	const file = path.slice(path.lastIndexOf("/") + 1);
+	const dot = file.lastIndexOf(".");
+	return (dot > 0 ? file.slice(0, dot) : file).trim();
+}
+
+function sanitizeFileStem(stem: string): string {
+	const safe = stem.replace(/[\\/:*?"<>|]/g, "-").trim();
+	return safe || "file-item";
+}
+
+function normalizeExtension(extension: string): string {
+	return extension.trim().toLowerCase();
 }
 
 function sortItems(

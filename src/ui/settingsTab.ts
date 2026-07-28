@@ -252,9 +252,9 @@ export class AiNotebookSettingTab extends PluginSettingTab {
 			);
 
 		
-		containerEl.createEl("h3", { text: "手机网页入口（局域网）" });
+		containerEl.createEl("h3", { text: "手机网页入口（局域网 / Tailscale / 公网）" });
 		containerEl.createEl("p", {
-			text: "电脑生成链接，手机同一 Wi‑Fi 浏览器打开即可写字/录音，数据直达本机笔记并由 AI 整理。无需官方同步。",
+			text: "电脑生成链接，手机可通过同一 Wi‑Fi、Tailscale 虚拟局域网或公网隧道打开，写字/录音会直达本机笔记并由 AI 整理。无需官方同步。",
 			cls: "setting-item-description",
 		});
 
@@ -316,6 +316,15 @@ export class AiNotebookSettingTab extends PluginSettingTab {
 						};
 						await this.plugin.saveSettings();
 					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Tailscale 虚拟局域网")
+			.setDesc("电脑和手机都连接同一个 Tailscale 账号后，点「显示 / 复制手机链接」，复制 100.x 的 Tailscale 链接到手机浏览器。端口仍使用上方本地服务端口。")
+			.addButton((b) =>
+				b.setButtonText("显示链接").onClick(() => {
+					void this.plugin.showMobileBridgeLink();
+				}),
 			);
 
 		new Setting(containerEl)

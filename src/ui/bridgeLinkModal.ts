@@ -42,7 +42,7 @@ export class BridgeLinkModal extends Modal {
 		contentEl.createEl("h2", { text: "手机网页入口" });
 
 		contentEl.createEl("p", {
-			text: "电脑开着 Obsidian 时，生成一个网页链接。手机用任意网络（Wi‑Fi / 4G / 5G）打开即可写字、录音；内容写回本机笔记并由 AI 整理。",
+			text: "电脑开着 Obsidian 时，生成一个网页链接。手机可通过 Tailscale 虚拟局域网、同 Wi‑Fi 局域网或公网隧道打开；内容写回本机笔记并由 AI 整理。",
 			cls: "setting-item-description",
 		});
 
@@ -70,10 +70,51 @@ export class BridgeLinkModal extends Modal {
 			pre.textContent = this.status.tunnelHint;
 		}
 
-		// ——— Any network (primary) ———
-		contentEl.createEl("h3", { text: "① 任意网络可打开（推荐发给手机）" });
+		// ——— Tailscale virtual LAN ———
+		contentEl.createEl("h3", { text: "① Tailscale 虚拟局域网（推荐稳定）" });
 		contentEl.createEl("p", {
-			text: "需要公网隧道：一键 Cloudflare 临时隧道，或手动填入 ngrok 等地址。",
+			text: this.status.running
+				? "电脑和手机都登录同一个 Tailscale 后，手机复制下面的 100.x 链接即可访问；不要求同一 Wi‑Fi，也不需要公网隧道。"
+				: "先启动本地服务，再复制 100.x 的 Tailscale 链接到手机浏览器；电脑和手机需登录同一个 Tailscale。",
+			cls: "setting-item-description",
+		});
+		if (this.status.tailscaleUrls.length === 0) {
+			contentEl.createEl("p", {
+				text: "未检测到 Tailscale 地址。请确认电脑端 Tailscale 已连接，然后点「启动/刷新 Tailscale 链接」；若仍为空，可在 Tailscale 客户端查看本机 100.x 地址。",
+				cls: "setting-item-description",
+			});
+		} else {
+			this.renderUrlList(contentEl, this.status.tailscaleUrls, true);
+		}
+		new Setting(contentEl).addButton((b) =>
+			b
+				.setButtonText(
+					this.status.running
+						? "刷新 Tailscale 链接"
+						: "启动/刷新 Tailscale 链接",
+				)
+				.onClick(async () => {
+					try {
+						if (!this.status.running) {
+							this.status = await this.handlers.onStartLocal();
+						} else {
+							this.status = this.handlers.onRefresh();
+						}
+						this.render();
+					} catch (e) {
+						new Notice(
+							`启动失败: ${e instanceof Error ? e.message : String(e)}`,
+						);
+						this.status = this.handlers.onRefresh();
+						this.render();
+					}
+				}),
+		);
+
+		// ——— Any network ———
+		contentEl.createEl("h3", { text: "② 任意网络公网链接（Cloudflare/ngrok）" });
+		contentEl.createEl("p", {
+			text: "需要公网隧道：一键 Cloudflare 临时隧道，或手动填入 ngrok 等地址。Tailscale 可用时通常不需要这一项。",
 			cls: "setting-item-description",
 		});
 
@@ -136,7 +177,7 @@ export class BridgeLinkModal extends Modal {
 			);
 
 		// ——— LAN ———
-		contentEl.createEl("h3", { text: "② 仅同一 Wi‑Fi（局域网）" });
+		contentEl.createEl("h3", { text: "③ 仅同一 Wi‑Fi（普通局域网）" });
 		contentEl.createEl("p", {
 			text: "不经过公网。手机必须和电脑同一路由器。优先复制 192.168.x.x，不要用 127.0.0.1 给手机。",
 			cls: "setting-item-description",

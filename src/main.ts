@@ -527,11 +527,12 @@ this.addSettingTab(new AiNotebookSettingTab(this.app, this));
 			}
 		}
 
-		// Try public if preferred and none yet
+		// Try public only when no Tailscale virtual LAN link is available.
 		let status = this.bridge.getStatus(this.bridgeStatusExtra());
 		if (
 			this.settings.bridge.preferPublicTunnel &&
-			status.publicUrls.length === 0
+			status.publicUrls.length === 0 &&
+			status.tailscaleUrls.length === 0
 		) {
 			new Notice("正在尝试生成任意网络可访问链接…");
 			status = await this.ensurePublicBridge();

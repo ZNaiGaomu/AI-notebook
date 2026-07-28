@@ -36,6 +36,8 @@ export type BridgeStatus = {
 	port: number;
 	/** LAN + localhost links (same Wi‑Fi) */
 	urls: string[];
+	/** Tailscale virtual LAN links (100.64.0.0/10) */
+	tailscaleUrls: string[];
 	/** Any-network HTTPS (or http) links via tunnel / manual publicBaseUrl */
 	publicUrls: string[];
 	token: string;
@@ -74,7 +76,12 @@ export class MobileBridgeServer {
 		const s = this.deps.getSettings();
 		const port = s.bridge.port || 27124;
 		const token = s.bridge.token || "";
-		const urls = this.listLanUrls(port, token);
+		const base = MobileBridgeServer.buildStatusFromAddresses({
+			running: this.isRunning(),
+			port,
+			token,
+			addresses: ["127.0.0.1", ...listLocalAddresses()],
+		});
 		const publicBase =
 			(extra?.publicBaseUrl || s.bridge.publicBaseUrl || "").replace(
 				/\/+$/,
@@ -85,14 +92,35 @@ export class MobileBridgeServer {
 			publicUrls.push(this.publicUrlWithToken(publicBase, token));
 		}
 		return {
-			running: this.isRunning(),
-			port,
-			urls,
+			...base,
 			publicUrls,
-			token,
 			publicBaseUrl: publicBase || undefined,
 			error: this.lastError,
 			tunnelHint: extra?.tunnelHint,
+		};
+	}
+
+	static buildStatusFromAddresses(input: {
+		running: boolean;
+		port: number;
+		token: string;
+		addresses: string[];
+	}): BridgeStatus {
+		const q = input.token ? `?t=${encodeURIComponent(input.token)}` : "";
+		const unique = [...new Set(input.addresses.filter(Boolean))];
+		const tailscaleUrls = unique
+			.filter(isTailscaleAddress)
+			.map((ip) => httpUrlForAddress(ip, input.port, q));
+		const urls = unique
+			.filter((ip) => !isTailscaleAddress(ip))
+			.map((ip) => httpUrlForAddress(ip, input.port, q));
+		return {
+			running: input.running,
+			port: input.port,
+			urls,
+			tailscaleUrls,
+			publicUrls: [],
+			token: input.token,
 		};
 	}
 	publicUrlWithToken(publicBase: string, token: string): string {
@@ -152,12 +180,12 @@ export class MobileBridgeServer {
 		});
 	}
 	listLanUrls(port: number, token: string): string[] {
-		const ips = listLocalIPv4();
-		const q = token ? `?t=${encodeURIComponent(token)}` : "";
-		const urls = ips.map((ip) => `http://${ip}:${port}/${q}`);
-		// always include localhost for desktop preview
-		urls.unshift(`http://127.0.0.1:${port}/${q}`);
-		return [...new Set(urls)];
+		return MobileBridgeServer.buildStatusFromAddresses({
+			running: this.isRunning(),
+			port,
+			token,
+			addresses: ["127.0.0.1", ...listLocalAddresses()],
+		}).urls;
 	}
 
 	private authOk(req: IncomingMessage, url: URL): boolean {
@@ -617,18 +645,47 @@ export class MobileBridgeServer {
 	}
 }
 
-function listLocalIPv4(): string[] {
+function listLocalAddresses(): string[] {
 	const nets = os.networkInterfaces();
 	const out: string[] = [];
 	for (const entries of Object.values(nets)) {
 		if (!entries) continue;
 		for (const e of entries) {
-			if (e.family === "IPv4" && !e.internal) {
-				out.push(e.address);
+			if ((e.family === "IPv4" || e.family === "IPv6") && !e.internal) {
+				out.push(stripIpv6Zone(e.address));
 			}
 		}
 	}
 	return out;
+}
+
+function httpUrlForAddress(address: string, port: number, query: string): string {
+	const host = address.includes(":") ? `[${stripIpv6Zone(address)}]` : address;
+	return `http://${host}:${port}/${query}`;
+}
+
+function stripIpv6Zone(address: string): string {
+	const i = address.indexOf("%");
+	return i >= 0 ? address.slice(0, i) : address;
+}
+
+function isTailscaleAddress(address: string): boolean {
+	return isTailscaleIPv4(address) || isTailscaleIPv6(address);
+}
+
+function isTailscaleIPv4(address: string): boolean {
+	const parts = address.split(".").map((p) => Number(p));
+	if (
+		parts.length !== 4 ||
+		parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)
+	) {
+		return false;
+	}
+	return parts[0] === 100 && parts[1] != null && parts[1] >= 64 && parts[1] <= 127;
+}
+
+function isTailscaleIPv6(address: string): boolean {
+	return stripIpv6Zone(address).toLowerCase().startsWith("fd7a:115c:a1e0:");
 }
 
 function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {

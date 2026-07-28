@@ -8,3 +8,4 @@
 | 0.2.0 | release/history/v0.2.0/ |
 | 0.3.0 | release/history/v0.3.0/ |
 | 0.3.1 | release/history/v0.3.1/ |
+| 0.4.0 | release/history/v0.4.0/ |
