@@ -1,7 +1,13 @@
 import * as http from "http";
 import * as os from "os";
 import type { IncomingMessage, ServerResponse } from "http";
-import type { AiNotebookSettings, NotebookMeta, ProviderProfile } from "../domain/types";
+import type {
+	AiNotebookSettings,
+	NotebookItem,
+	NotebookMeta,
+	ProviderProfile,
+	TemplateId,
+} from "../domain/types";
 import { createId, shortId } from "../domain/ids";
 import type { InboxService } from "../services/inboxService";
 import type { OrganizeService } from "../services/organizeService";
@@ -18,6 +24,12 @@ export type BridgeDeps = {
 	resolveNotebookById: (
 		id: string | null | undefined,
 	) => Promise<NotebookMeta | null>;
+	/** Strict lookup: never falls back to default notebook. */
+	findNotebookById?: (id: string) => Promise<NotebookMeta | null>;
+	createNotebook?: (input: {
+		name: string;
+		templateId: TemplateId;
+	}) => Promise<NotebookMeta>;
 	/** Persist preferred mobile target notebook */
 	setDefaultNotebookId?: (id: string | null) => Promise<void>;
 	resolveVoice: (
@@ -321,6 +333,33 @@ export class MobileBridgeServer {
 				});
 				return;
 			}
+			if (url.pathname === "/api/notebooks" && req.method === "POST") {
+				const body = await readJson(req);
+				await this.handleCreateNotebook(res, body);
+				return;
+			}
+			if (url.pathname === "/api/items" && req.method === "GET") {
+				const meta = await this.resolveStrictNotebook(
+					url.searchParams.get("notebook_id") ||
+						url.searchParams.get("notebookId"),
+				);
+				if (!meta) {
+					this.json(res, 400, { ok: false, error: "notebook_id 无效" });
+					return;
+				}
+				const items = await this.deps.items.listItems(meta);
+				this.json(res, 200, {
+					ok: true,
+					notebookId: meta.notebook_id,
+					items: items.map(itemPayload),
+				});
+				return;
+			}
+			if (url.pathname === "/api/items" && req.method === "POST") {
+				const body = await readJson(req);
+				await this.handleCreateItem(res, body);
+				return;
+			}
 			if (url.pathname === "/api/text" && req.method === "POST") {
 				const body = await readJson(req);
 				await this.handleText(res, body);
@@ -345,6 +384,84 @@ export class MobileBridgeServer {
 		}
 	}
 
+	private async handleCreateNotebook(
+		res: ServerResponse,
+		body: Record<string, unknown>,
+	): Promise<void> {
+		if (!this.deps.createNotebook) {
+			this.json(res, 501, { ok: false, error: "手机端暂不支持新建记录本" });
+			return;
+		}
+		const name = String(body.name ?? "").trim();
+		if (!name) {
+			this.json(res, 400, { ok: false, error: "记录本名称为空" });
+			return;
+		}
+		const templateId = pickTemplateId(body);
+		const meta = await this.deps.createNotebook({ name, templateId });
+		if (this.deps.setDefaultNotebookId) {
+			await this.deps.setDefaultNotebookId(meta.notebook_id);
+		}
+		this.json(res, 200, {
+			ok: true,
+			defaultId: meta.notebook_id,
+			notebook: notebookPayload(meta),
+		});
+	}
+
+	private async handleCreateItem(
+		res: ServerResponse,
+		body: Record<string, unknown>,
+	): Promise<void> {
+		const meta = await this.resolveStrictNotebook(pickNotebookId(body));
+		if (!meta) {
+			this.json(res, 400, { ok: false, error: "notebook_id 无效" });
+			return;
+		}
+		const title = String(body.title ?? "").trim();
+		if (!title) {
+			this.json(res, 400, { ok: false, error: "条目名称为空" });
+			return;
+		}
+		const item = await this.deps.items.createItem(meta, {
+			title,
+			body: String(body.body ?? ""),
+			capturedAt: pickCapturedAt(body),
+			fields: { source: "mobile-web-item" },
+		});
+		this.pushRecent({
+			title: item.frontmatter.title,
+			preview: item.body.slice(0, 80),
+			path: item.path,
+			organized: false,
+			at: recentAt(body),
+		});
+		this.deps.onNoteWritten?.({ title: item.frontmatter.title, path: item.path });
+		this.json(res, 200, { ok: true, item: itemPayload(item) });
+	}
+
+	private async resolveStrictNotebook(
+		notebookId: string | null | undefined,
+	): Promise<NotebookMeta | null> {
+		const id = String(notebookId ?? "").trim();
+		if (!id) return null;
+		if (this.deps.findNotebookById) return this.deps.findNotebookById(id);
+		const found = await this.deps.resolveNotebookById(id);
+		return found?.notebook_id === id ? found : null;
+	}
+
+	private async appendToItem(
+		meta: NotebookMeta,
+		itemId: string,
+		body: string,
+		heading: string,
+		fields?: Record<string, unknown>,
+	): Promise<NotebookItem | null> {
+		const item = await this.deps.items.findById(meta, itemId);
+		if (!item) return null;
+		return this.deps.items.appendToItem(item, { body, heading, fields });
+	}
+
 	private async handleText(
 		res: ServerResponse,
 		body: Record<string, unknown>,
@@ -360,6 +477,7 @@ export class MobileBridgeServer {
 				: Boolean(body.organize);
 		const source = String(body.source ?? "mobile-web");
 		const notebookId = pickNotebookId(body);
+		const itemId = pickItemId(body);
 		if (!organize) {
 			const path = await this.deps.inbox.dumpRaw({
 				text,
@@ -377,7 +495,9 @@ export class MobileBridgeServer {
 			this.json(res, 200, { ok: true, path, organized: false });
 			return;
 		}
-		const meta = await this.deps.resolveNotebookById(notebookId);
+		const meta = itemId
+			? await this.resolveStrictNotebook(notebookId)
+			: await this.deps.resolveNotebookById(notebookId);
 		if (!meta) {
 			// fall back to inbox
 			const path = await this.deps.inbox.dumpRaw({ text, source: "mobile" });
@@ -386,6 +506,33 @@ export class MobileBridgeServer {
 				path,
 				organized: false,
 				warning: "无记录本，已写入收件箱",
+			});
+			return;
+		}
+		if (itemId) {
+			const updated = await this.appendToItem(meta, itemId, text, "手机追加");
+			if (!updated) {
+				this.json(res, 404, { ok: false, error: "条目不存在" });
+				return;
+			}
+			this.pushRecent({
+				title: updated.frontmatter.title,
+				preview: text.slice(0, 80),
+				path: updated.path,
+				organized: false,
+				at: recentAt(body),
+			});
+			this.deps.onNoteWritten?.({
+				title: updated.frontmatter.title,
+				path: updated.path,
+			});
+			this.json(res, 200, {
+				ok: true,
+				appended: true,
+				itemId: updated.frontmatter.item_id,
+				title: updated.frontmatter.title,
+				path: updated.path,
+				organized: false,
 			});
 			return;
 		}
@@ -430,7 +577,10 @@ export class MobileBridgeServer {
 				? this.deps.getSettings().bridge.autoOrganize
 				: Boolean(body.organize);
 		const notebookId = pickNotebookId(body);
-		const meta = await this.deps.resolveNotebookById(notebookId);
+		const itemId = pickItemId(body);
+		const meta = itemId
+			? await this.resolveStrictNotebook(notebookId)
+			: await this.deps.resolveNotebookById(notebookId);
 		const resolved = this.deps.resolveVoice(meta);
 		if (!resolved) {
 			this.json(res, 400, {
@@ -486,6 +636,39 @@ export class MobileBridgeServer {
 			});
 			return;
 		}
+		if (itemId) {
+			const updated = await this.appendToItem(
+				meta,
+				itemId,
+				tr.text,
+				"语音转写追加",
+			);
+			if (!updated) {
+				this.json(res, 404, { ok: false, error: "条目不存在" });
+				return;
+			}
+			this.pushRecent({
+				title: updated.frontmatter.title,
+				preview: tr.text.slice(0, 80),
+				path: updated.path,
+				organized: false,
+				at: recentAt(body),
+			});
+			this.deps.onNoteWritten?.({
+				title: updated.frontmatter.title,
+				path: updated.path,
+			});
+			this.json(res, 200, {
+				ok: true,
+				appended: true,
+				transcript: tr.text,
+				itemId: updated.frontmatter.item_id,
+				title: updated.frontmatter.title,
+				path: updated.path,
+				organized: false,
+			});
+			return;
+		}
 		const cap = await this.deps.organize.captureStructured(meta, tr.text, {
 			useAi: true,
 			source: "mobile-web-voice",
@@ -527,7 +710,10 @@ export class MobileBridgeServer {
 		);
 		const mime = String(body.mimeType ?? "application/octet-stream");
 		const notebookId = pickNotebookId(body);
-		const meta = await this.deps.resolveNotebookById(notebookId);
+		const itemId = pickItemId(body);
+		const meta = itemId
+			? await this.resolveStrictNotebook(notebookId)
+			: await this.deps.resolveNotebookById(notebookId);
 		const buf = Buffer.from(b64, "base64");
 		const ab = buf.buffer.slice(
 			buf.byteOffset,
@@ -564,6 +750,11 @@ export class MobileBridgeServer {
 			});
 			return;
 		}
+		const targetItem = itemId ? await this.deps.items.findById(meta, itemId) : null;
+		if (itemId && !targetItem) {
+			this.json(res, 404, { ok: false, error: "条目不存在" });
+			return;
+		}
 
 		// 1) Write real binary into vault attachments + cabinet index
 		const stored = await this.deps.cabinet.importBinary(meta, {
@@ -586,6 +777,40 @@ export class MobileBridgeServer {
 		]
 			.filter((x) => x !== "")
 			.join("\n");
+
+		if (targetItem) {
+			const refs = targetItem.frontmatter.cabinet_refs || [];
+			const nextRefs = refs.includes(stored.id) ? refs : [...refs, stored.id];
+			const updated = await this.deps.items.appendToItem(targetItem, {
+				body: noteBody,
+				heading: `追加文件 · ${fileName}`,
+				fields: { cabinet_refs: nextRefs },
+			});
+			this.pushRecent({
+				title: updated.frontmatter.title,
+				preview: fileName,
+				path: updated.path,
+				organized: false,
+				at: new Date().toISOString(),
+			});
+			this.deps.onNoteWritten?.({
+				title: updated.frontmatter.title,
+				path: updated.path,
+			});
+			this.json(res, 200, {
+				ok: true,
+				appended: true,
+				itemId: updated.frontmatter.item_id,
+				title: updated.frontmatter.title,
+				path: updated.path,
+				vaultPath: stored.vaultPath,
+				fileName,
+				size: buf.length,
+				mime,
+				organized: false,
+			});
+			return;
+		}
 
 		const item = await this.deps.items.createItem(meta, {
 			title: noteTitle || fileName,
@@ -718,11 +943,52 @@ function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
 	});
 }
 
+function notebookPayload(meta: NotebookMeta): { id: string; name: string } {
+	return { id: meta.notebook_id, name: meta.name };
+}
+
+function itemPayload(item: NotebookItem): {
+	id: string;
+	title: string;
+	path: string;
+	created: string;
+	updated: string;
+	preview: string;
+} {
+	return {
+		id: item.frontmatter.item_id,
+		title: item.frontmatter.title,
+		path: item.path,
+		created: item.frontmatter.created,
+		updated: item.frontmatter.updated,
+		preview: item.body.slice(0, 80),
+	};
+}
+
 function pickNotebookId(body: Record<string, unknown>): string | null {
 	const raw = body.notebook_id ?? body.notebookId;
 	if (raw == null) return null;
 	const s = String(raw).trim();
 	return s || null;
+}
+
+function pickItemId(body: Record<string, unknown>): string | null {
+	const raw = body.item_id ?? body.itemId;
+	if (raw == null) return null;
+	const s = String(raw).trim();
+	return s || null;
+}
+
+function pickTemplateId(body: Record<string, unknown>): TemplateId {
+	const raw = String(body.templateId ?? body.template_id ?? "blank").trim();
+	const allowed: TemplateId[] = [
+		"blank",
+		"literature",
+		"idea",
+		"meeting",
+		"cabinet-first",
+	];
+	return allowed.includes(raw as TemplateId) ? (raw as TemplateId) : "blank";
 }
 
 /** Mobile capture time from client (queue createdAt / capturedAt). */

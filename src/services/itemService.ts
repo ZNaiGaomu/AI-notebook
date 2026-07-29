@@ -143,6 +143,33 @@ export class ItemService {
 		return { path: item.path, frontmatter: nextFm, body };
 	}
 
+	async findById(
+		meta: NotebookMeta,
+		itemId: string | null | undefined,
+	): Promise<NotebookItem | null> {
+		const id = String(itemId ?? "").trim();
+		if (!id) return null;
+		const items = await this.listItems(meta);
+		return items.find((item) => item.frontmatter.item_id === id) ?? null;
+	}
+
+	async appendToItem(
+		item: NotebookItem,
+		input: {
+			body: string;
+			heading?: string;
+			fields?: Record<string, unknown>;
+		},
+	): Promise<NotebookItem> {
+		const addition = input.body.trim();
+		if (!addition) throw new Error("追加内容为空");
+		const nextBody = appendBodyBlock(item.body, addition, input.heading);
+		return this.updateItem(item, {
+			body: nextBody,
+			fields: input.fields,
+		});
+	}
+
 	async softDelete(meta: NotebookMeta, item: NotebookItem): Promise<void> {
 		const settings = this.getSettings();
 		const trashDir = trashItemsDir(settings, meta.folderName);
@@ -317,6 +344,17 @@ export class ItemService {
 	defaultEntityType(blueprint: Blueprint): string {
 		return blueprint.entityTypes[0]?.id ?? "note";
 	}
+}
+
+function appendBodyBlock(
+	currentBody: string,
+	addition: string,
+	heading?: string,
+): string {
+	const parts = [currentBody.trimEnd()];
+	const block = heading ? `## ${heading}\n\n${addition}` : addition;
+	if (!parts[0]) return block;
+	return `${parts[0]}\n\n${block}`;
 }
 
 function coerceFrontmatter(

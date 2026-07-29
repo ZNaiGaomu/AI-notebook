@@ -20,6 +20,12 @@ describe("mobile bridge page + settings", () => {
 		expect(html).toContain("abc123token");
 		expect(html).toContain("/api/text");
 		expect(html).toContain("/api/voice");
+		expect(html).toContain("/api/items");
+		expect(html).toContain("/api/notebooks");
+		expect(html).toContain("新建记录本");
+		expect(html).toContain("新建条目");
+		expect(html).toContain("追加到正文末尾");
+		expect(html).toContain("item_id");
 		expect(html).toContain("待发送");
 		expect(html).toContain("垃圾箱");
 		expect(html).toContain("indexedDB");

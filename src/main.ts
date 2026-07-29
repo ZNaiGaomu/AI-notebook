@@ -132,6 +132,31 @@ export default class AiNotebookPlugin extends Plugin {
 			},
 			resolveTargetNotebook: () => this.inbox.resolveTargetNotebook(),
 			listNotebooks: () => this.notebooks.listNotebooks(),
+			findNotebookById: (id) => this.notebooks.findById(id),
+			createNotebook: async ({ name, templateId }) => {
+				const meta = await this.notebooks.createNotebook({ name, templateId });
+				this.settings = {
+					...this.settings,
+					inbox: {
+						...this.settings.inbox,
+						defaultNotebookId: meta.notebook_id,
+					},
+					ui: {
+						...this.settings.ui,
+						lastNotebookId: meta.notebook_id,
+					},
+				};
+				await this.saveSettings();
+				new Notice(`手机新建记录本：${meta.name}`);
+				const leaves = this.app.workspace.getLeavesOfType(
+					VIEW_TYPE_AI_NOTEBOOK,
+				);
+				const view = leaves[0]?.view;
+				if (view instanceof NotebookView) {
+					void view.reload();
+				}
+				return meta;
+			},
 			resolveNotebookById: async (id) => {
 				if (id) {
 					const found = await this.notebooks.findById(id);

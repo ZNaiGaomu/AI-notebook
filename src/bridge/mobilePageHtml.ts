@@ -73,7 +73,33 @@ button:disabled{opacity:.45}
   <div class="card">
     <label for="nb">发送到哪个记录本</label>
     <select id="nb"></select>
-    <div class="meta" style="margin-top:6px">在电脑命令面板也可「新建记录本」。此处选择后，发送会进入对应本。</div>
+    <div class="row">
+      <button id="btnToggleNotebook" class="secondary" type="button">新建记录本</button>
+      <button id="btnToggleItem" class="secondary" type="button">新建条目</button>
+    </div>
+    <div id="newNotebookBox" class="hidden" style="margin-top:10px">
+      <label for="newNotebookName">记录本名称</label>
+      <input id="newNotebookName" type="text" placeholder="例如：旅行记录、读书摘录" />
+      <label for="newNotebookTemplate" style="margin-top:10px">模板</label>
+      <select id="newNotebookTemplate">
+        <option value="blank">空白本</option>
+        <option value="literature">文献本</option>
+        <option value="idea">灵感本</option>
+        <option value="meeting">会议本</option>
+        <option value="cabinet-first">收藏向</option>
+      </select>
+      <div class="row"><button id="btnCreateNotebook" type="button">创建并选中</button></div>
+    </div>
+    <label for="item" style="margin-top:12px">发送到哪个条目</label>
+    <select id="item"></select>
+    <div class="meta" style="margin-top:6px">选“新建条目”=本次发送会新建条目；选已有条目=追加到正文末尾。</div>
+    <div id="newItemBox" class="hidden" style="margin-top:10px">
+      <label for="newItemTitle">条目名称</label>
+      <input id="newItemTitle" type="text" placeholder="例如：《卡片笔记写作法》摘录" />
+      <label for="newItemBody" style="margin-top:10px">初始正文（可空）</label>
+      <textarea id="newItemBody" placeholder="可先留空，创建后发送内容会追加到这个条目"></textarea>
+      <div class="row"><button id="btnCreateItem" type="button">创建条目并选中</button></div>
+    </div>
   </div>
 
   <div class="tabs">
@@ -175,10 +201,13 @@ try {
 } catch (e) { TOKEN = TOKEN || ""; }
 const DEFAULT_NB = ${defaultIdJson};
 const NOTEBOOKS = ${notebooksJson};
+let notebooksState = (NOTEBOOKS || []).slice();
+let itemsState = [];
 const DB_NAME = "ai-notebook-mobile-v1";
 const TRASH_MS = 30 * 24 * 60 * 60 * 1000;
 let lanOk = false;
-let selectedNb = DEFAULT_NB || (NOTEBOOKS[0] && NOTEBOOKS[0].id) || "";
+let selectedNb = DEFAULT_NB || (notebooksState[0] && notebooksState[0].id) || "";
+let selectedItem = "";
 
 function qs(path) {
   try {
@@ -279,32 +308,94 @@ async function api(path, body) {
 function fillNotebooks(list, defaultId) {
   const sel = document.getElementById("nb");
   if (!sel) return;
+  notebooksState = (list || []).slice();
   var prev = selectedNb || defaultId || "";
   sel.innerHTML = "";
-  list = list || [];
-  if (!list.length) {
+  if (!notebooksState.length) {
     const o = document.createElement("option");
     o.value = ""; o.textContent = "（电脑上还没有记录本，请先新建）";
     sel.appendChild(o);
     selectedNb = "";
+    fillItems([], "");
     return;
   }
   var hasPrev = false;
-  list.forEach(function(n) {
+  notebooksState.forEach(function(n) {
     const o = document.createElement("option");
     o.value = n.id; o.textContent = n.name;
     sel.appendChild(o);
     if (n.id === prev) hasPrev = true;
   });
-  selectedNb = hasPrev ? prev : (defaultId || list[0].id);
+  selectedNb = hasPrev ? prev : (defaultId || notebooksState[0].id);
   sel.value = selectedNb;
   sel.onchange = function() {
     selectedNb = sel.value;
+    selectedItem = "";
+    fillItems([], "");
     if (lanOk && selectedNb) {
       api("/api/notebook", { notebook_id: selectedNb }).catch(function(){});
+      refreshItems(selectedNb).catch(function(e){ setStatus(String(e.message || e), "err"); });
     }
   };
+  if (lanOk && selectedNb) {
+    refreshItems(selectedNb).catch(function(){});
+  }
 }
+
+function fillItems(list, preferredItemId) {
+  const sel = document.getElementById("item");
+  if (!sel) return;
+  itemsState = (list || []).slice();
+  var prev = preferredItemId != null ? String(preferredItemId) : selectedItem;
+  sel.innerHTML = "";
+  const fresh = document.createElement("option");
+  fresh.value = "";
+  fresh.textContent = "＋ 新建条目（发送时自动生成）";
+  sel.appendChild(fresh);
+  var hasPrev = !prev;
+  itemsState.forEach(function(it) {
+    const o = document.createElement("option");
+    o.value = it.id;
+    o.textContent = it.title || "未命名";
+    sel.appendChild(o);
+    if (it.id === prev) hasPrev = true;
+  });
+  selectedItem = hasPrev ? (prev || "") : "";
+  sel.value = selectedItem;
+  sel.onchange = function() {
+    selectedItem = sel.value || "";
+  };
+}
+
+async function refreshItems(notebookId, preferredItemId) {
+  if (!lanOk || !notebookId) {
+    fillItems([], "");
+    return;
+  }
+  const r = await api("/api/items?notebook_id=" + encodeURIComponent(notebookId));
+  fillItems(r.items || [], preferredItemId);
+}
+
+function currentTargetPayload() {
+  return {
+    notebook_id: selectedNb || "",
+    item_id: selectedItem || "",
+  };
+}
+
+function currentTargetLabel() {
+  if (!selectedItem) return "新建条目";
+  for (var i = 0; i < itemsState.length; i++) {
+    if (itemsState[i].id === selectedItem) return "追加到：" + (itemsState[i].title || "未命名");
+  }
+  return "追加到已有条目";
+}
+
+async function refreshNotebooks(preferredId) {
+  const r = await api("/api/notebooks");
+  fillNotebooks(r.notebooks || [], preferredId || r.defaultId || selectedNb);
+}
+
 
 function setLan(ok, detail) {
   lanOk = !!ok;
@@ -454,10 +545,63 @@ document.querySelectorAll(".tabs button").forEach(function(b) {
   b.onclick = function() { switchTab(b.getAttribute("data-tab")); };
 });
 
+
+document.getElementById("btnToggleNotebook").onclick = function() {
+  document.getElementById("newNotebookBox").classList.toggle("hidden");
+};
+document.getElementById("btnToggleItem").onclick = function() {
+  document.getElementById("newItemBox").classList.toggle("hidden");
+};
+document.getElementById("btnCreateNotebook").onclick = async function() {
+  var name = document.getElementById("newNotebookName").value.trim();
+  if (!name) return setStatus("请输入记录本名称", "err");
+  if (!lanOk) return setStatus("未连接电脑，不能新建记录本", "err");
+  try {
+    var templateId = document.getElementById("newNotebookTemplate").value || "blank";
+    var r = await api("/api/notebooks", { name: name, templateId: templateId });
+    var nb = r.notebook;
+    selectedNb = nb && nb.id || r.defaultId || "";
+    selectedItem = "";
+    document.getElementById("newNotebookName").value = "";
+    document.getElementById("newNotebookBox").classList.add("hidden");
+    await refreshNotebooks(selectedNb);
+    setStatus("已创建记录本：" + (nb && nb.name || name), "ok");
+  } catch (e) {
+    setStatus("新建记录本失败：" + (e.message || e), "err");
+  }
+};
+document.getElementById("btnCreateItem").onclick = async function() {
+  var title = document.getElementById("newItemTitle").value.trim();
+  if (!title) return setStatus("请输入条目名称", "err");
+  if (!selectedNb) return setStatus("请先选择记录本", "err");
+  if (!lanOk) return setStatus("未连接电脑，不能新建条目", "err");
+  try {
+    var body = document.getElementById("newItemBody").value || "";
+    var r = await api("/api/items", {
+      notebook_id: selectedNb,
+      title: title,
+      body: body,
+      capturedAt: Date.now(),
+    });
+    var it = r.item;
+    selectedItem = it && it.id || "";
+    document.getElementById("newItemTitle").value = "";
+    document.getElementById("newItemBody").value = "";
+    document.getElementById("newItemBox").classList.add("hidden");
+    await refreshItems(selectedNb, selectedItem);
+    setStatus("已创建条目，后续发送将追加到：" + (it && it.title || title), "ok");
+  } catch (e) {
+    setStatus("新建条目失败：" + (e.message || e), "err");
+  }
+};
+
 async function addQueueItem(item) {
   item.id = item.id || uid();
   item.createdAt = item.createdAt || Date.now();
-  item.notebook_id = item.notebook_id || selectedNb || "";
+  var target = currentTargetPayload();
+  item.notebook_id = item.notebook_id || target.notebook_id || "";
+  item.item_id = item.item_id || target.item_id || "";
+  item.targetLabel = item.targetLabel || currentTargetLabel();
   await storePut("queue", item);
   setStatus("已加入待发送（本地缓存）", "ok");
   renderQueue();
@@ -478,10 +622,10 @@ document.getElementById("btnSendNow").onclick = async function() {
     setStatus("未连局域网：已缓存到待发送", "err");
     return;
   }
-  setStatus("发送并整理中…");
+  setStatus(selectedItem ? "追加到条目中…" : "发送并整理中…");
   try {
-    const r = await api("/api/text", { text: text, organize: true, source: "mobile-web", notebook_id: selectedNb, capturedAt: Date.now() });
-    setStatus("已写入：" + (r.title || r.path || "ok") + (r.organized ? "（已 AI 整理）" : ""), "ok");
+    const r = await api("/api/text", Object.assign({ text: text, organize: true, source: "mobile-web", capturedAt: Date.now() }, currentTargetPayload()));
+    setStatus((r.appended ? "已追加：" : "已写入：") + (r.title || r.path || "ok") + (r.organized ? "（已 AI 整理）" : ""), "ok");
     document.getElementById("text").value = "";
     refreshRecent();
   } catch (e) {
@@ -500,7 +644,7 @@ document.getElementById("btnInbox").onclick = async function() {
   }
   setStatus("写入收件箱…");
   try {
-    const r = await api("/api/text", { text: text, organize: false, source: "mobile-web", notebook_id: selectedNb, capturedAt: Date.now() });
+    const r = await api("/api/text", { text: text, organize: false, source: "mobile-web", capturedAt: Date.now() });
     setStatus("已进收件箱：" + (r.path || "ok"), "ok");
     document.getElementById("text").value = "";
     refreshRecent();
@@ -530,6 +674,7 @@ async function sendOne(it) {
       organize: it.organize !== false,
       source: "mobile-web-queue",
       notebook_id: it.notebook_id || selectedNb,
+      item_id: it.item_id || "",
       capturedAt: capturedAt,
       createdAt: capturedAt,
     });
@@ -541,6 +686,7 @@ async function sendOne(it) {
       organize: true,
       source: "mobile-web-voice-queue",
       notebook_id: it.notebook_id || selectedNb,
+      item_id: it.item_id || "",
       capturedAt: capturedAt,
       createdAt: capturedAt,
     });
@@ -552,6 +698,7 @@ async function sendOne(it) {
       mimeType: it.mimeType,
       title: it.title,
       notebook_id: it.notebook_id || selectedNb,
+      item_id: it.item_id || "",
       capturedAt: capturedAt,
       createdAt: capturedAt,
     });
@@ -879,6 +1026,7 @@ async function renderQueue() {
   items.forEach(function(it) {
     var li = document.createElement("li");
     var label = it.type + " · " + esc(it.title || it.fileName || it.text || "").slice(0, 60);
+    var target = it.targetLabel || (it.item_id ? "追加到已有条目" : "新建条目");
     var when = it.createdAt ? new Date(it.createdAt).toLocaleString() : "";
     var inPipe = isInSendPipeline(it.id);
     var isActive = p && p.activeId === it.id;
@@ -894,7 +1042,7 @@ async function renderQueue() {
     }
     // queued/active can be checked for cancel; free for send
     li.innerHTML = "<div class='" + rowCls + "'><input type='checkbox' data-id='" + esc(it.id) + "'" + dis + "/><div><strong>" +
-      label + "</strong>" + badge + "<div class='meta'>做成 " + when + " · 发送后电脑将使用此时间</div></div></div>";
+      label + "</strong>" + badge + "<div class='meta'>目标 " + esc(target) + " · 做成 " + when + " · 发送后电脑将使用此时间</div></div></div>";
     ul.appendChild(li);
   });
 }
@@ -1126,7 +1274,7 @@ document.getElementById("btnVoiceSend").onclick = async function() {
   }
   setStatus("发送语音并整理…");
   try {
-    var r = await sendOne(Object.assign({ notebook_id: selectedNb }, pendingVoice));
+    var r = await sendOne(Object.assign(currentTargetPayload(), pendingVoice));
     pendingVoice = null;
     setVoiceActions(false);
     setVoiceReady("");
@@ -1157,6 +1305,7 @@ document.getElementById("btnVoiceInbox").onclick = async function() {
       organize: false,
       source: "mobile-web-voice",
       notebook_id: selectedNb,
+      item_id: "",
     });
     pendingVoice = null;
     setVoiceActions(false);
@@ -1201,6 +1350,7 @@ async function processSelectedFiles(mode) {
         mimeType: ff.type || "application/octet-stream",
         title: ff.name,
         notebook_id: selectedNb,
+        item_id: selectedItem || "",
         capturedAt: Date.now(),
       });
       ok++;
