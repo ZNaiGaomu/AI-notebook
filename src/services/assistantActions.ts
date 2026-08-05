@@ -4,10 +4,12 @@ import type {
 	NotebookItem,
 	NotebookMeta,
 } from "../domain/types";
-import { attachmentsDir, joinPath } from "../infra/paths";
+import { joinPath, structuredAttachmentsDir } from "../infra/paths";
 import type { IVaultFs } from "../infra/vaultPort";
 import type { ItemService } from "./itemService";
 import type { CabinetService } from "./cabinetService";
+import type { AttachmentService } from "./attachmentService";
+import { buildAttachmentEmbedMarkdown } from "./attachmentService";
 
 /**
  * Structured actions the assistant may emit and the plugin will execute.
@@ -364,6 +366,7 @@ export class AssistantActionRunner {
 	constructor(
 		private readonly items: ItemService,
 		private readonly cabinet: CabinetService,
+		private readonly attachments: AttachmentService,
 		private readonly vault: IVaultFs,
 		private readonly getSettings: () => AiNotebookSettings,
 	) {}
@@ -444,15 +447,19 @@ export class AssistantActionRunner {
 						);
 						continue;
 					}
-					const vaultPath = await this.writePendingToAttachments(
-						meta,
-						file,
-					);
-					const embedMd = buildMediaEmbedMarkdown(
-						vaultPath,
-						file,
-						action.caption,
-					);
+					const stored = await this.attachments.importBinary(meta, {
+						displayName: file.name,
+						data: file.data,
+						mime: file.mime,
+						item_id: target.frontmatter.item_id,
+						itemName: target.frontmatter.title,
+						kind: "embedded",
+						origin: "assistant-embed",
+					});
+					const vaultPath = stored.vaultPath;
+					const embedMd = buildAttachmentEmbedMarkdown(stored, {
+						caption: action.caption,
+					});
 					const placement = action.placement ?? "append";
 					let nextBody: string;
 					if (placement === "replace_body") {
@@ -503,6 +510,9 @@ export class AssistantActionRunner {
 						data: file.data,
 						mime: file.mime,
 						item_id: target?.frontmatter.item_id ?? null,
+						itemName: target?.frontmatter.title ?? null,
+						kind: "backup",
+						origin: "assistant-cabinet",
 					});
 					if (target) {
 						const refs = [
@@ -536,10 +546,18 @@ export class AssistantActionRunner {
 
 	private async writePendingToAttachments(
 		meta: NotebookMeta,
+		item: NotebookItem,
 		file: PendingChatFile,
 	): Promise<string> {
 		const settings = this.getSettings();
-		const destDir = attachmentsDir(settings, meta.notebook_id);
+		const destDir = structuredAttachmentsDir(
+			settings,
+			meta.notebook_id,
+			meta.name,
+			item.frontmatter.item_id,
+			item.frontmatter.title,
+			"embedded",
+		);
 		await this.vault.ensureFolder(destDir);
 		const safeName = await uniqueName(
 			sanitizeFileName(file.name),

@@ -15,6 +15,7 @@ import {
 	resolveProviderChain,
 } from "./services/providerResolver";
 import { CabinetService } from "./services/cabinetService";
+import { AttachmentService } from "./services/attachmentService";
 import { VoiceService } from "./services/voiceService";
 import { VoicePipeline } from "./services/voicePipeline";
 import { VoiceDiagnostics } from "./services/voiceDiagnostics";
@@ -49,6 +50,7 @@ export default class AiNotebookPlugin extends Plugin {
 	features!: FeatureOrchestrator;
 	hooks!: HookRunner;
 	cabinet!: CabinetService;
+	attachments!: AttachmentService;
 	voice!: VoiceService;
 	voicePipeline!: VoicePipeline;
 	organize!: OrganizeService;
@@ -86,6 +88,7 @@ export default class AiNotebookPlugin extends Plugin {
 			() => this.settings,
 		);
 		this.cabinet = new CabinetService(this.vaultIo, () => this.settings);
+		this.attachments = new AttachmentService(this.vaultIo, () => this.settings);
 		this.voice = new VoiceService();
 		this.runtime = new CapabilityRuntime();
 		this.gateway = new AiGateway();
@@ -124,6 +127,8 @@ export default class AiNotebookPlugin extends Plugin {
 			this.organize,
 			() => this.settings,
 		);
+		this.inbox.attachments = this.attachments;
+		this.inbox.items = this.items;
 		this.bridge = new MobileBridgeServer({
 			getSettings: () => this.settings,
 			saveSettings: async (s) => {
@@ -187,6 +192,7 @@ export default class AiNotebookPlugin extends Plugin {
 			voice: this.voice,
 			items: this.items,
 			cabinet: this.cabinet,
+			attachments: this.attachments,
 			onNoteWritten: (info) => {
 				new Notice(`手机写入：${info.title}`);
 				const leaves = this.app.workspace.getLeavesOfType(
@@ -199,6 +205,8 @@ export default class AiNotebookPlugin extends Plugin {
 			},
 		});
 		this.publicTunnel = new PublicTunnel();
+
+		this.registerAttachmentPasteWatcher();
 
 		this.registerView(
 			VIEW_TYPE_AI_NOTEBOOK,
@@ -564,6 +572,48 @@ this.addSettingTab(new AiNotebookSettingTab(this.app, this));
 		}
 
 		new BridgeLinkModal(this.app, status, this.bridgeModalHandlers()).open();
+	}
+
+
+	/**
+	 * When user pastes/drags a file into an item markdown note, Obsidian drops it
+	 * via default attachment rules. Absorb those embeds into the item attachment folder.
+	 */
+	private registerAttachmentPasteWatcher(): void {
+		const absorbForFile = async (path: string) => {
+			if (!path || !path.endsWith(".md")) return;
+			const notebooks = await this.notebooks.listNotebooks();
+			for (const meta of notebooks) {
+				const items = await this.items.listItems(meta);
+				const item = items.find((it) => it.path === path);
+				if (!item) continue;
+				try {
+					const { item: next, rewrites } =
+						await this.attachments.absorbEmbedsInItem(meta, item);
+					if (rewrites.length && next.body !== item.body) {
+						await this.items.updateItem(item, { body: next.body });
+						const leaves = this.app.workspace.getLeavesOfType(
+							VIEW_TYPE_AI_NOTEBOOK,
+						);
+						const view = leaves[0]?.view;
+						if (view instanceof NotebookView) {
+							void view.reload();
+						}
+					}
+				} catch {
+					// ignore
+				}
+				return;
+			}
+		};
+
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => {
+				if (file instanceof TFile && file.extension === "md") {
+					void absorbForFile(file.path);
+				}
+			}),
+		);
 	}
 
 	async loadSettings(): Promise<void> {

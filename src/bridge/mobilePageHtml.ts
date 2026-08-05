@@ -145,7 +145,7 @@ button:disabled{opacity:.45}
         <button id="btnFileSend" type="button">立即发送并整理</button>
         <button id="btnFileInbox" class="secondary" type="button">仅收件箱</button>
       </div>
-      <div class="meta">图片/视频写入电脑附件并在笔记中嵌入预览。大文件建议同 Wi‑Fi 发送。</div>
+      <div class="meta">普通文件会保存到附件管理，并自动插入正文预览；仅收件箱只存文字说明。删除正文与删除附件互不影响。</div>
     </div>
   </div>
 
@@ -683,7 +683,7 @@ async function sendOne(it) {
     return api("/api/voice", {
       audioBase64: it.audioBase64,
       mimeType: it.mimeType || "audio/wav",
-      organize: true,
+      organize: it.organize !== false,
       source: "mobile-web-voice-queue",
       notebook_id: it.notebook_id || selectedNb,
       item_id: it.item_id || "",
@@ -697,6 +697,7 @@ async function sendOne(it) {
       fileName: it.fileName,
       mimeType: it.mimeType,
       title: it.title,
+      organize: it.organize !== false,
       notebook_id: it.notebook_id || selectedNb,
       item_id: it.item_id || "",
       capturedAt: capturedAt,
@@ -1027,6 +1028,7 @@ async function renderQueue() {
     var li = document.createElement("li");
     var label = it.type + " · " + esc(it.title || it.fileName || it.text || "").slice(0, 60);
     var target = it.targetLabel || (it.item_id ? "追加到已有条目" : "新建条目");
+    if (it.type === "file" && it.organize === false) target = "仅收件箱（只存说明）";
     var when = it.createdAt ? new Date(it.createdAt).toLocaleString() : "";
     var inPipe = isInSendPipeline(it.id);
     var isActive = p && p.activeId === it.id;
@@ -1291,12 +1293,14 @@ document.getElementById("btnVoiceSend").onclick = async function() {
 document.getElementById("btnVoiceInbox").onclick = async function() {
   if (!pendingVoice) return setStatus("请先录音", "err");
   if (!lanOk) {
-    await addQueueItem(Object.assign({}, pendingVoice));
+    await addQueueItem(Object.assign({}, pendingVoice, {
+      organize: false,
+      targetLabel: "仅收件箱（语音转写）",
+    }));
     pendingVoice = null;
     setVoiceActions(false);
     setVoiceReady("");
     setStatus("未连局域网：已缓存", "err");
-    return;
   }
   try {
     var r = await api("/api/voice", {
@@ -1332,6 +1336,8 @@ async function processSelectedFiles(mode) {
         fileBase64: b64,
         title: f.name,
         size: f.size,
+        organize: mode !== "inbox",
+        targetLabel: mode === "inbox" ? "仅收件箱（只存说明）" : undefined,
       });
     }
     input.value = "";
@@ -1349,6 +1355,7 @@ async function processSelectedFiles(mode) {
         fileName: ff.name,
         mimeType: ff.type || "application/octet-stream",
         title: ff.name,
+        organize: mode === "inbox" ? false : true,
         notebook_id: selectedNb,
         item_id: selectedItem || "",
         capturedAt: Date.now(),
@@ -1366,6 +1373,8 @@ async function processSelectedFiles(mode) {
           fileBase64: b2,
           title: f2.name,
           size: f2.size,
+          organize: mode === "inbox" ? false : true,
+          targetLabel: mode === "inbox" ? "仅收件箱（只存说明）" : undefined,
         });
       } catch (e2) {}
     }

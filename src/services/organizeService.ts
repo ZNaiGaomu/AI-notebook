@@ -96,7 +96,8 @@ export class OrganizeService {
 3. tags/multi-select 用字符串数组。
 4. checkbox 用 boolean；number 用数字；date 用 YYYY-MM-DD。
 5. body 用中文分层结构，保留关键事实与原文要点。
-6. 只输出 JSON。`;
+6. 原文中的 Obsidian 媒体嵌入（![[...]]）必须原样保留在 body 中，不可删除或改写路径。
+7. 只输出 JSON。`;
 
 		const user = [
 			`记录本: ${meta.name}`,
@@ -292,7 +293,7 @@ function ensureVaultEmbeds(original: string, nextBody: string): string {
 		if (!out.includes(e)) missing.push(e);
 	}
 	if (!missing.length) return out;
-	return `${out.trimEnd()}\n\n## 录音\n\n${missing.join("\n")}\n`;
+	return `${out.trimEnd()}\n\n## 附件\n\n${missing.join("\n")}\n`;
 }
 
 function extractOrganizeJson(text: string):

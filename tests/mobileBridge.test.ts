@@ -27,8 +27,10 @@ describe("mobile bridge page + settings", () => {
 		expect(html).toContain("追加到正文末尾");
 		expect(html).toContain("item_id");
 		expect(html).toContain("待发送");
-		expect(html).toContain("垃圾箱");
-		expect(html).toContain("indexedDB");
+		expect(html).toContain("仅收件箱");
+		expect(html).toContain("organize: it.organize !== false");
+		expect(html).toContain("仅收件箱（只存说明）");
+		expect(html).toContain("自动插入正文预览");
 	});
 
 	it("normalizes bridge defaults", () => {

@@ -41,6 +41,39 @@ function httpGet(
 	});
 }
 
+function httpPost(
+	port: number,
+	path: string,
+	body: Record<string, unknown>,
+	headers?: Record<string, string>,
+): Promise<{ status: number; body: string }> {
+	return new Promise((resolve, reject) => {
+		const payload = JSON.stringify(body);
+		const req = http.request(
+			{
+				hostname: "127.0.0.1",
+				port,
+				path,
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"Content-Length": Buffer.byteLength(payload),
+					...(headers || {}),
+				},
+			},
+			(res) => {
+				let responseBody = "";
+				res.on("data", (chunk) => (responseBody += chunk));
+				res.on("end", () =>
+					resolve({ status: res.statusCode || 0, body: responseBody }),
+				);
+			},
+		);
+		req.on("error", reject);
+		req.end(payload);
+	});
+}
+
 describe("mobile bridge live connectivity", () => {
 	const port = 27888;
 	const token = "live-test-token-xyz";
@@ -53,6 +86,8 @@ describe("mobile bridge live connectivity", () => {
 		},
 	};
 
+	let inboxWrites = 0;
+	let cabinetImports = 0;
 	const server = new MobileBridgeServer({
 		getSettings: () => settings,
 		saveSettings: async (s) => {
@@ -64,7 +99,14 @@ describe("mobile bridge live connectivity", () => {
 			id === "nb2" ? nb("nb2", "本B") : nb("nb1", "本A"),
 		resolveVoice: () => null,
 		inbox: {
-			dumpRaw: async () => "inbox.md",
+			dumpRaw: async () => {
+				inboxWrites++;
+				return "inbox.md";
+			},
+			dumpBinary: async () => {
+				inboxWrites++;
+				return { notePath: "inbox.md", filePath: "AI Inbox/files/x.bin" };
+			},
 			saveVoiceRaw: async () => undefined,
 		} as never,
 		organize: {
@@ -89,13 +131,30 @@ describe("mobile bridge live connectivity", () => {
 				frontmatter: { title: "t", item_id: "i", cabinet_refs: [] },
 			}),
 			updateItem: async (i: unknown) => i,
+			findById: async () => null,
+			appendToItem: async (i: any) => i,
 		} as never,
 		cabinet: {
-			importBinary: async () => ({
-				id: "c",
-				vaultPath: "a/x",
-				item_id: null,
-			}),
+			importBinary: async () => {
+				cabinetImports++;
+				return {
+					id: "c",
+					vaultPath: "a/x",
+					item_id: null,
+				};
+			},
+		} as never,
+		attachments: {
+			importBinary: async () => {
+				cabinetImports++;
+				return {
+					id: "att",
+					vaultPath: "a/x",
+					displayName: "paper.pdf",
+					mime: "application/pdf",
+					item_id: "i",
+				};
+			},
 		} as never,
 	});
 
@@ -147,5 +206,30 @@ describe("mobile bridge live connectivity", () => {
 
 		const noTok = await httpGet(port, `/api/status`);
 		expect(noTok.status).toBe(401);
+	});
+
+	it("stores file inbox submissions as notes without importing binaries", async () => {
+		await server.start();
+		const beforeInbox = inboxWrites;
+		const beforeImports = cabinetImports;
+		const response = await httpPost(
+			port,
+			`/api/file?t=${token}`,
+			{
+				fileBase64: Buffer.from("pdf-bytes").toString("base64"),
+				fileName: "paper.pdf",
+				mimeType: "application/pdf",
+				organize: false,
+				notebook_id: "nb1",
+			},
+		);
+		expect(response.status).toBe(200);
+		expect(JSON.parse(response.body)).toMatchObject({
+			ok: true,
+			inboxOnly: true,
+			organized: false,
+		});
+		expect(inboxWrites).toBe(beforeInbox + 1);
+		expect(cabinetImports).toBe(beforeImports);
 	});
 });

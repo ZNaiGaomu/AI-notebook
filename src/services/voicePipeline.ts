@@ -4,7 +4,7 @@ import type {
 	ProviderProfile,
 } from "../domain/types";
 import { createId, shortId, todayDatePrefix } from "../domain/ids";
-import { attachmentsDir, joinPath } from "../infra/paths";
+import { joinPath, structuredAttachmentsDir } from "../infra/paths";
 import type { IVaultFs } from "../infra/vaultPort";
 import type { AiGateway } from "../infra/aiGateway";
 import type { VoiceService } from "./voiceService";
@@ -74,7 +74,14 @@ export class VoicePipeline {
 		filename: string,
 	): Promise<{ vaultPath: string; arrayBuffer: ArrayBuffer }> {
 		const settings = this.getSettings();
-		const dir = attachmentsDir(settings, meta.notebook_id);
+		const dir = structuredAttachmentsDir(
+			settings,
+			meta.notebook_id,
+			meta.name,
+			null,
+			null,
+			"voice",
+		);
 		await this.vault.ensureFolder(dir);
 		const safe = sanitizeName(filename || "audio.wav");
 		const vaultPath = joinPath(

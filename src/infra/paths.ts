@@ -72,6 +72,21 @@ export function cabinetDir(
 	return joinPath(notebookFolderPath(settings, folderName), "cabinet");
 }
 
+/** Notebook-local attachment index (independent of 收藏柜). */
+export function notebookAttachmentsDir(
+	settings: AiNotebookSettings,
+	folderName: string,
+): string {
+	return joinPath(notebookFolderPath(settings, folderName), "attachments");
+}
+
+export function notebookAttachmentsIndexPath(
+	settings: AiNotebookSettings,
+	folderName: string,
+): string {
+	return joinPath(notebookAttachmentsDir(settings, folderName), "index.json");
+}
+
 export function trashItemsDir(
 	settings: AiNotebookSettings,
 	folderName: string,
@@ -90,6 +105,71 @@ export function attachmentsDir(
 }
 
 /**
+ * Human-readable attachment layout:
+ *   {attachmentsRoot}/{notebookTitle}/[items/{itemTitle}|_unlinked]/{kind}/
+ * Title collisions are resolved by callers (suffix) when needed.
+ * notebookId/itemId remain available for legacy path detection.
+ */
+export function structuredAttachmentsDir(
+	settings: AiNotebookSettings,
+	_notebookId: string,
+	notebookName: string,
+	itemId: string | null | undefined,
+	itemName: string | null | undefined,
+	kind: string = "backup",
+): string {
+	const notebookSegment = pathSegment(notebookName, "未命名记录本");
+	const safeKind = pathSegment(kind, "backup");
+	if (!itemId) {
+		return joinPath(
+			attachmentsRoot(settings),
+			notebookSegment,
+			"_unlinked",
+			safeKind,
+		);
+	}
+	const itemSegment = pathSegment(itemName, "未命名条目");
+	return joinPath(
+		attachmentsRoot(settings),
+		notebookSegment,
+		"items",
+		itemSegment,
+		safeKind,
+	);
+}
+
+/** Parent folder for one item's attachments (without kind). */
+export function structuredItemAttachmentsRoot(
+	settings: AiNotebookSettings,
+	notebookName: string,
+	itemName: string,
+): string {
+	return joinPath(
+		attachmentsRoot(settings),
+		pathSegment(notebookName, "未命名记录本"),
+		"items",
+		pathSegment(itemName, "未命名条目"),
+	);
+}
+
+export function attachmentsRoot(settings: AiNotebookSettings): string {
+	return settings.paths.attachmentsRoot.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+export function pathSegment(
+	value: string | null | undefined,
+	fallback: string,
+): string {
+	const cleaned = String(value ?? "")
+		.trim()
+		.replace(/[\\/:*?"<>|]/g, "-")
+		.replace(/\s+/g, " ")
+		.replace(/\.+$/g, "")
+		.slice(0, 80);
+	return cleaned || fallback;
+}
+
+/**
  * Root for assistant chat uploads (history / re-download).
  * May be vault-relative OR absolute (user picked any disk folder).
  * Default: `{attachmentsRoot}/chat-uploads`
@@ -105,7 +185,28 @@ export function chatUploadsRoot(settings: AiNotebookSettings): string {
 	return joinPath(att, "chat-uploads");
 }
 
-/** Per notebook (+ optional item) folder for chat-upload archive. */
+export function structuredChatUploadsDir(
+	settings: AiNotebookSettings,
+	_notebookId: string,
+	notebookName: string,
+	itemId: string | null | undefined,
+	itemName: string | null | undefined,
+): string {
+	const root = chatUploadsRoot(settings);
+	const notebookSegment = pathSegment(notebookName, "未命名记录本");
+	if (!itemId) {
+		return joinPath(root, notebookSegment, "_unlinked", "chat");
+	}
+	const itemSegment = pathSegment(itemName, "未命名条目");
+	return joinPath(root, notebookSegment, "items", itemSegment, "chat");
+}
+
+/** Inbox binary drop zone for files that still need organizing. */
+export function inboxFilesDir(settings: AiNotebookSettings): string {
+	return joinPath(inboxRoot(settings), "files");
+}
+
+/** Per notebook (+ optional item) folder for legacy chat-upload archives. */
 export function chatUploadsDir(
 	settings: AiNotebookSettings,
 	notebookId: string,

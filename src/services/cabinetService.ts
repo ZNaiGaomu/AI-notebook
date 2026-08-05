@@ -1,9 +1,11 @@
 import type { AiNotebookSettings, NotebookMeta } from "../domain/types";
 import { createId, nowIso } from "../domain/ids";
 import {
-	attachmentsDir,
+	attachmentsRoot,
 	cabinetDir,
 	joinPath,
+	notebooksRoot,
+	structuredAttachmentsDir,
 } from "../infra/paths";
 import type { IVaultFs } from "../infra/vaultPort";
 
@@ -17,6 +19,14 @@ export type CabinetLink = {
 	updated: string;
 };
 
+export type CabinetFileOwnership = "managed" | "external";
+export type CabinetFileKind =
+	| "backup"
+	| "voice"
+	| "chat"
+	| "embedded"
+	| "unknown";
+
 export type CabinetFile = {
 	id: string;
 	displayName: string;
@@ -24,7 +34,23 @@ export type CabinetFile = {
 	mime: string;
 	size: number;
 	item_id: string | null;
+	ownership: CabinetFileOwnership;
+	kind: CabinetFileKind;
+	origin: string;
+	managedRoot: string | null;
 	created: string;
+};
+
+export type RemoveCabinetFileResult = {
+	recordRemoved: boolean;
+	physicalDeleted: boolean;
+	reason:
+		| "record-only"
+		| "not-found"
+		| "external"
+		| "shared-path"
+		| "unsafe-path"
+		| "deleted";
 };
 
 type LinkStore = { items: CabinetLink[] };
@@ -76,30 +102,23 @@ export class CabinetService {
 		return link;
 	}
 
-	/**
-	 * Manual parse: set title from URL hostname + path tail (no network fetch in V1 core).
-	 * Real fetch can fail CORS in desktop webview; user asked for click-to-parse.
-	 */
 	async parseLinkTitle(meta: NotebookMeta, linkId: string): Promise<CabinetLink> {
 		const store = await this.readLinks(meta.folderName);
-		const idx = store.items.findIndex((l) => l.id === linkId);
+		const idx = store.items.findIndex((link) => link.id === linkId);
 		if (idx < 0) throw new Error("链接不存在");
 		const link = store.items[idx]!;
-		const title = deriveTitleFromUrl(link.url);
 		const updated: CabinetLink = {
 			...link,
-			title,
+			title: deriveTitleFromUrl(link.url),
 			updated: nowIso(),
 		};
-		const items = store.items.map((l, i) => (i === idx ? updated : l));
+		const items = store.items.map((candidate, index) =>
+			index === idx ? updated : candidate,
+		);
 		await this.vault.writeJson(this.linksPath(meta.folderName), { items });
 		return updated;
 	}
 
-	/**
-	 * Register a file already in vault (or write binary-less placeholder content for tests).
-	 * In Obsidian runtime, caller should copy binary via vault API then call this with path.
-	 */
 	async addFileRef(
 		meta: NotebookMeta,
 		input: {
@@ -108,18 +127,33 @@ export class CabinetService {
 			mime?: string;
 			size?: number;
 			item_id?: string | null;
-			/** If provided, write this text content to vaultPath (for smoke tests). */
+			itemName?: string | null;
+			ownership?: CabinetFileOwnership;
+			kind?: CabinetFileKind;
+			origin?: string;
+			managedRoot?: string;
 			textContent?: string;
 		},
 	): Promise<CabinetFile> {
 		const settings = this.getSettings();
-		const destDir = attachmentsDir(settings, meta.notebook_id);
-		await this.vault.ensureFolder(destDir);
-
+		const ownership =
+			input.ownership ?? (input.textContent != null ? "managed" : "external");
+		const kind = input.kind ?? "backup";
 		let vaultPath = input.vaultPath;
+		let managedRoot = input.managedRoot ?? null;
+
 		if (input.textContent != null) {
-			const safeName = sanitizeFileName(input.displayName);
-			vaultPath = joinPath(destDir, safeName);
+			const destDir = structuredAttachmentsDir(
+				settings,
+				meta.notebook_id,
+				meta.name,
+				input.item_id,
+				input.itemName,
+				kind,
+			);
+			await this.vault.ensureFolder(destDir);
+			vaultPath = joinPath(destDir, sanitizeFileName(input.displayName));
+			managedRoot = destDir;
 			await this.vault.write(vaultPath, input.textContent);
 		}
 
@@ -131,6 +165,12 @@ export class CabinetService {
 			mime: input.mime ?? "application/octet-stream",
 			size: input.size ?? (input.textContent?.length ?? 0),
 			item_id: input.item_id ?? null,
+			ownership,
+			kind,
+			origin:
+				input.origin ??
+				(ownership === "managed" ? "imported" : "external-reference"),
+			managedRoot: ownership === "managed" ? managedRoot : null,
 			created: nowIso(),
 		};
 		await this.vault.writeJson(this.filesPath(meta.folderName), {
@@ -139,9 +179,6 @@ export class CabinetService {
 		return file;
 	}
 
-	/**
-	 * Register a file that already lives in the vault (no copy).
-	 */
 	async registerVaultFile(
 		meta: NotebookMeta,
 		input: {
@@ -150,6 +187,7 @@ export class CabinetService {
 			mime?: string;
 			size?: number;
 			item_id?: string | null;
+			itemName?: string | null;
 		},
 	): Promise<CabinetFile> {
 		const vaultPath = input.vaultPath.trim();
@@ -167,12 +205,13 @@ export class CabinetService {
 			mime: input.mime ?? guessMime(displayName),
 			size: input.size ?? 0,
 			item_id: input.item_id ?? null,
+			itemName: input.itemName,
+			ownership: "external",
+			kind: "backup",
+			origin: "external-reference",
 		});
 	}
 
-	/**
-	 * Import binary from outside the vault: copy into attachments then register.
-	 */
 	async importBinary(
 		meta: NotebookMeta,
 		input: {
@@ -180,10 +219,20 @@ export class CabinetService {
 			data: ArrayBuffer;
 			mime?: string;
 			item_id?: string | null;
+			itemName?: string | null;
+			kind?: CabinetFileKind;
+			origin?: string;
 		},
 	): Promise<CabinetFile> {
-		const settings = this.getSettings();
-		const destDir = attachmentsDir(settings, meta.notebook_id);
+		const kind = input.kind ?? "backup";
+		const destDir = structuredAttachmentsDir(
+			this.getSettings(),
+			meta.notebook_id,
+			meta.name,
+			input.item_id,
+			input.itemName,
+			kind,
+		);
 		await this.vault.ensureFolder(destDir);
 		const baseName = sanitizeFileName(input.displayName);
 		const safeName = await uniqueFileName(baseName, async (name) =>
@@ -200,32 +249,144 @@ export class CabinetService {
 			mime: input.mime ?? guessMime(safeName),
 			size: input.data.byteLength,
 			item_id: input.item_id ?? null,
+			itemName: input.itemName,
+			ownership: "managed",
+			kind,
+			origin: input.origin ?? "imported",
+			managedRoot: destDir,
 		});
 	}
 
-		async removeLink(meta: NotebookMeta, linkId: string): Promise<void> {
+	async assignFileToItem(
+		meta: NotebookMeta,
+		fileId: string,
+		itemId: string,
+		itemName: string,
+	): Promise<CabinetFile> {
+		const store = await this.readFiles(meta.folderName);
+		const target = store.items.find((file) => file.id === fileId);
+		if (!target) throw new Error("附件记录不存在");
+
+		let updated: CabinetFile = {
+			...target,
+			item_id: itemId,
+		};
+		if (target.ownership === "managed") {
+			if (
+				!isManagedChildPath(target.vaultPath, target.managedRoot) ||
+				!isManagedChildPath(target.vaultPath, attachmentsRoot(this.getSettings())) ||
+				isNotebookDataPath(target.vaultPath, this.getSettings())
+			) {
+				throw new Error("附件路径不属于插件托管目录，不能移动");
+			}
+			const destDir = structuredAttachmentsDir(
+				this.getSettings(),
+				meta.notebook_id,
+				meta.name,
+				itemId,
+				itemName,
+				target.kind,
+			);
+			await this.vault.ensureFolder(destDir);
+			const baseName = sanitizeFileName(
+				target.vaultPath.slice(target.vaultPath.lastIndexOf("/") + 1) ||
+					target.displayName,
+			);
+			const safeName = await uniqueFileName(baseName, async (name) =>
+				this.vault.exists(joinPath(destDir, name)),
+			);
+			const nextPath = joinPath(destDir, safeName);
+			if (!sameVaultPath(target.vaultPath, nextPath)) {
+				await this.vault.move(target.vaultPath, nextPath);
+			}
+			updated = {
+				...updated,
+				vaultPath: nextPath,
+				managedRoot: destDir,
+			};
+		}
+
+		await this.vault.writeJson(this.filesPath(meta.folderName), {
+			items: store.items.map((file) => (file.id === fileId ? updated : file)),
+		});
+		return updated;
+	}
+
+	async removeLink(meta: NotebookMeta, linkId: string): Promise<void> {
 		const store = await this.readLinks(meta.folderName);
 		await this.vault.writeJson(this.linksPath(meta.folderName), {
-			items: store.items.filter((l) => l.id !== linkId),
+			items: store.items.filter((link) => link.id !== linkId),
 		});
 	}
 
-	async removeFile(meta: NotebookMeta, fileId: string): Promise<void> {
+	async removeFile(
+		meta: NotebookMeta,
+		fileId: string,
+		options?: { deleteManagedFile?: boolean },
+	): Promise<RemoveCabinetFileResult> {
 		const store = await this.readFiles(meta.folderName);
-		const target = store.items.find((f) => f.id === fileId);
+		const target = store.items.find((file) => file.id === fileId);
+		const remaining = store.items.filter((file) => file.id !== fileId);
 		await this.vault.writeJson(this.filesPath(meta.folderName), {
-			items: store.items.filter((f) => f.id !== fileId),
+			items: remaining,
 		});
-		if (target) {
-			try {
-				await this.vault.remove(target.vaultPath);
-			} catch {
-				// file may already be gone
-			}
+		if (!target) {
+			return {
+				recordRemoved: false,
+				physicalDeleted: false,
+				reason: "not-found",
+			};
 		}
+		if (!options?.deleteManagedFile) {
+			return {
+				recordRemoved: true,
+				physicalDeleted: false,
+				reason: "record-only",
+			};
+		}
+		if (target.ownership !== "managed") {
+			return {
+				recordRemoved: true,
+				physicalDeleted: false,
+				reason: "external",
+			};
+		}
+		if (remaining.some((file) => sameVaultPath(file.vaultPath, target.vaultPath))) {
+			return {
+				recordRemoved: true,
+				physicalDeleted: false,
+				reason: "shared-path",
+			};
+		}
+		if (!isManagedChildPath(target.vaultPath, target.managedRoot)) {
+			return {
+				recordRemoved: true,
+				physicalDeleted: false,
+				reason: "unsafe-path",
+			};
+		}
+		if (!isManagedChildPath(target.vaultPath, attachmentsRoot(this.getSettings()))) {
+			return {
+				recordRemoved: true,
+				physicalDeleted: false,
+				reason: "unsafe-path",
+			};
+		}
+		if (isNotebookDataPath(target.vaultPath, this.getSettings())) {
+			return {
+				recordRemoved: true,
+				physicalDeleted: false,
+				reason: "unsafe-path",
+			};
+		}
+		await this.vault.remove(target.vaultPath);
+		return {
+			recordRemoved: true,
+			physicalDeleted: true,
+			reason: "deleted",
+		};
 	}
 
-	/** Hook helper: if item has url field, ensure a cabinet link exists. */
 	async attachIfUrl(
 		meta: NotebookMeta,
 		item: { item_id: string; url?: unknown; title?: string },
@@ -234,7 +395,7 @@ export class CabinetService {
 		if (!url) return null;
 		const existing = await this.listLinks(meta);
 		const found = existing.find(
-			(l) => l.url === url && l.item_id === item.item_id,
+			(link) => link.url === url && link.item_id === item.item_id,
 		);
 		if (found) return found;
 		return this.addLink(meta, {
@@ -262,17 +423,88 @@ export class CabinetService {
 			await this.vault.writeJson(path, empty);
 			return empty;
 		}
-		const data = await this.vault.readJson<FileStore>(path);
-		return { items: Array.isArray(data.items) ? data.items : [] };
+		const data = await this.vault.readJson<{ items?: unknown[] }>(path);
+		return {
+			items: Array.isArray(data.items)
+				? data.items.map((item) => normalizeCabinetFile(item))
+				: [],
+		};
 	}
+}
+
+function normalizeCabinetFile(raw: unknown): CabinetFile {
+	const item = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+	const ownership: CabinetFileOwnership =
+		item.ownership === "managed" ? "managed" : "external";
+	const rawKind = String(item.kind ?? "unknown");
+	const kinds: CabinetFileKind[] = [
+		"backup",
+		"voice",
+		"chat",
+		"embedded",
+		"unknown",
+	];
+	return {
+		id: String(item.id ?? ""),
+		displayName: String(item.displayName ?? "file"),
+		vaultPath: String(item.vaultPath ?? ""),
+		mime: String(item.mime ?? "application/octet-stream"),
+		size: Number(item.size ?? 0),
+		item_id:
+			typeof item.item_id === "string" && item.item_id.trim()
+				? item.item_id
+				: null,
+		ownership,
+		kind: kinds.includes(rawKind as CabinetFileKind)
+			? (rawKind as CabinetFileKind)
+			: "unknown",
+		origin: String(
+			item.origin ??
+				(ownership === "managed" ? "legacy-managed" : "legacy-external"),
+		),
+		managedRoot:
+			ownership === "managed" && typeof item.managedRoot === "string"
+				? item.managedRoot
+				: null,
+		created: String(item.created ?? ""),
+	};
+}
+
+function isManagedChildPath(path: string, root: string | null): boolean {
+	if (!root) return false;
+	const normalizedPath = normalizeSafePath(path);
+	const normalizedRoot = normalizeSafePath(root);
+	if (!normalizedPath || !normalizedRoot) return false;
+	return normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
+function isNotebookDataPath(path: string, settings: AiNotebookSettings): boolean {
+	const normalized = normalizeSafePath(path);
+	const root = normalizeSafePath(notebooksRoot(settings));
+	return Boolean(normalized && root && normalized.startsWith(`${root}/`));
+}
+
+function sameVaultPath(left: string, right: string): boolean {
+	return normalizeSafePath(left) === normalizeSafePath(right);
+}
+
+function normalizeSafePath(path: string): string {
+	const normalized = path
+		.replace(/\\/g, "/")
+		.replace(/\/{2,}/g, "/")
+		.replace(/^\/+|\/+$/g, "");
+	if (!normalized || normalized.split("/").some((part) => part === "..")) {
+		return "";
+	}
+	return normalized;
 }
 
 function deriveTitleFromUrl(url: string): string {
 	try {
-		const u = new URL(url);
-		const tail = u.pathname.split("/").filter(Boolean).pop() ?? "";
-		const decoded = decodeURIComponent(tail || u.hostname);
-		return decoded || u.hostname;
+		const parsed = new URL(url);
+		const tail = parsed.pathname.split("/").filter(Boolean).pop() ?? "";
+		const decoded = decodeURIComponent(tail || parsed.hostname);
+		return decoded || parsed.hostname;
 	} catch {
 		return url.slice(0, 80);
 	}

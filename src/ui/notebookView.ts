@@ -27,6 +27,9 @@ import { ChatHistoryModal } from "./chatHistoryModal";
 import { PickNotebookModal } from "./pickNotebookModal";
 import { CreateNotebookModal } from "./createNotebookModal";
 import type { ChatThread } from "../services/chatHistoryStore";
+import type { CabinetFile, CabinetFileKind } from "../services/cabinetService";
+import type { AttachmentKind, AttachmentRecord } from "../services/attachmentService";
+import { buildAttachmentEmbedMarkdown } from "../services/attachmentService";
 import { AddCabinetLinkModal } from "./addCabinetLinkModal";
 import {
 	VaultFileSuggestModal,
@@ -68,7 +71,7 @@ export class NotebookView extends ItemView {
 	private items: NotebookItem[] = [];
 	private activeItem: NotebookItem | null = null;
 	private chatMode: "assistant" | "feature" = "assistant";
-	private leftTab: "items" | "cabinet" | "inbox" = "items";
+	private leftTab: "items" | "attachments" | "cabinet" | "inbox" = "items";
 	/** list | table | board — from blueprint.views, user-switchable */
 	private itemViewMode: "list" | "table" | "board" = "list";
 	private listFilters: ListFilterState = {};
@@ -227,14 +230,20 @@ export class NotebookView extends ItemView {
 
 		const tabBar = listPane.createDiv({ cls: "ai-notebook-tab-bar" });
 		const itemsTab = tabBar.createEl("button", { text: "条目" });
+		const attTab = tabBar.createEl("button", { text: "附件" });
 		const cabTab = tabBar.createEl("button", { text: "收藏柜" });
 		const inboxTab = tabBar.createEl("button", { text: "收件箱" });
 		itemsTab.toggleClass("mod-cta", this.leftTab === "items");
+		attTab.toggleClass("mod-cta", this.leftTab === "attachments");
 		cabTab.toggleClass("mod-cta", this.leftTab === "cabinet");
 		inboxTab.toggleClass("mod-cta", this.leftTab === "inbox");
 		itemsTab.addEventListener("click", () => {
 			this.leftTab = "items";
 			this.render();
+		});
+		attTab.addEventListener("click", () => {
+			this.leftTab = "attachments";
+			void this.renderAttachments(listPane, detailPane);
 		});
 		cabTab.addEventListener("click", () => {
 			this.leftTab = "cabinet";
@@ -245,7 +254,9 @@ export class NotebookView extends ItemView {
 			void this.renderInbox(listPane, detailPane);
 		});
 
-		if (this.leftTab === "cabinet") {
+		if (this.leftTab === "attachments") {
+			void this.renderAttachments(listPane, detailPane);
+		} else if (this.leftTab === "cabinet") {
 			void this.renderCabinet(listPane, detailPane);
 		} else if (this.leftTab === "inbox") {
 			void this.renderInbox(listPane, detailPane);
@@ -595,6 +606,48 @@ export class NotebookView extends ItemView {
 					audio_path: vaultPath,
 				},
 			});
+			try {
+				const voiceFile = await this.plugin.attachments.registerManaged(
+					this.meta,
+					{
+						displayName: recorded.filename || "audio.wav",
+						vaultPath,
+						mime: recorded.blob.type || "audio/wav",
+						size: recorded.blob.size,
+						item_id: pendingItem.frontmatter.item_id,
+						kind: "voice",
+						origin: "desktop-voice",
+						managedRoot: vaultPath.slice(0, vaultPath.lastIndexOf("/")),
+					},
+				);
+				const assigned = await this.plugin.attachments.assignToItem(
+					this.meta,
+					voiceFile.id,
+					pendingItem.frontmatter.item_id,
+					pendingItem.frontmatter.title,
+				);
+				if (assigned.vaultPath !== vaultPath) {
+					vaultPath = assigned.vaultPath;
+					const { buildEmbedMarkdown } = await import(
+						"../services/voicePipeline"
+					);
+					embedMarkdown = buildEmbedMarkdown(vaultPath);
+				}
+				pendingItem = await this.plugin.items.updateItem(pendingItem, {
+					body: [
+						"## 转写",
+						"",
+						"> ⏳ 转写处理中…（进度见进度浮条）",
+						"",
+						embedMarkdown,
+					].join("\n"),
+					fields: {
+						audio_path: vaultPath,
+					},
+				});
+			} catch {
+				// keep the safely saved audio and note if attachment registration fails
+			}
 			this.activeItem = pendingItem;
 			this.leftTab = "items";
 			await this.reload();
@@ -1016,11 +1069,11 @@ export class NotebookView extends ItemView {
 		detailPane.empty();
 		detailPane.createDiv({
 			cls: "ai-notebook-empty",
-			text: "选择收件项查看 / 单独处理。链路：手机 → pending → AI → 记录本。",
+			text: "选择收件项：可跨记录本整理，并可指定追加到已有条目；媒体会进入附件目录并可预览。",
 		});
 	}
 
-	private renderInboxDetail(
+		private renderInboxDetail(
 		pane: HTMLElement,
 		path: string,
 		title: string,
@@ -1030,8 +1083,111 @@ export class NotebookView extends ItemView {
 		pane.createEl("h3", { text: title });
 		pane.createEl("p", { text: path, cls: "setting-item-description" });
 		pane.createEl("pre", { text: preview });
+		void this.renderInboxActions(pane, path, title);
+	}
+
+	private async renderInboxActions(
+		pane: HTMLElement,
+		path: string,
+		_title: string,
+	): Promise<void> {
+		const notebooks = await this.plugin.notebooks.listNotebooks();
+		if (!notebooks.length) {
+			pane.createDiv({
+				cls: "ai-notebook-empty",
+				text: "没有记录本，请先新建。",
+			});
+			return;
+		}
+
+		let notebookId = this.meta?.notebook_id ?? notebooks[0]!.notebook_id;
+		let itemId = "";
+		let useAi = true;
+
+		const nbSetting = new Setting(pane).setName("目标记录本");
+		nbSetting.addDropdown((dd) => {
+			for (const nb of notebooks) {
+				dd.addOption(nb.notebook_id, nb.name);
+			}
+			dd.setValue(notebookId);
+			dd.onChange(async (v) => {
+				notebookId = v;
+				itemId = "";
+				await refreshItems();
+			});
+		});
+
+		const itemSetting = new Setting(pane).setName("目标条目");
+		let itemSelect: HTMLSelectElement | null = null;
+		itemSetting.addDropdown((dd) => {
+			itemSelect = (dd as unknown as { selectEl: HTMLSelectElement }).selectEl;
+			dd.addOption("", "新建条目");
+			dd.onChange((v) => {
+				itemId = v;
+			});
+		});
+
+		const refreshItems = async () => {
+			if (!itemSelect) return;
+			const meta =
+				notebooks.find((n) => n.notebook_id === notebookId) ?? notebooks[0]!;
+			const items = await this.plugin.items.listItems(meta);
+			itemSelect.empty();
+			const opt0 = itemSelect.createEl("option", { text: "新建条目", value: "" });
+			opt0.selected = true;
+			for (const it of items) {
+				itemSelect.createEl("option", {
+					text: it.frontmatter.title || it.frontmatter.item_id,
+					value: it.frontmatter.item_id,
+				});
+			}
+			itemId = "";
+		};
+		await refreshItems();
+
+		new Setting(pane).setName("AI 结构化").addToggle((tg) =>
+			tg.setValue(true).onChange((v) => {
+				useAi = v;
+			}),
+		);
+
 		new Setting(pane).addButton((b) =>
-			b.setButtonText("AI 整理到本记录本").setCta().onClick(async () => {
+			b
+				.setButtonText("整理进所选条目/记录本")
+				.setCta()
+				.onClick(async () => {
+					const meta =
+						notebooks.find((n) => n.notebook_id === notebookId) ?? null;
+					if (!meta) {
+						new Notice("请选择记录本");
+						return;
+					}
+					new Notice("整理中…");
+					const r = await this.plugin.inbox.processOne(path, {
+						notebook: meta,
+						useAi,
+						targetItemId: itemId || null,
+					});
+					if (!r.ok) {
+						new Notice(r.error);
+						return;
+					}
+					const mode = r.appended
+						? "已追加到条目"
+						: r.organized
+							? "已新建并结构化"
+							: "已新建条目";
+					new Notice(`${mode} → ${r.notebookName}`);
+					if (this.meta?.notebook_id !== meta.notebook_id) {
+						await this.setNotebookId(meta.notebook_id);
+					}
+					this.leftTab = "items";
+					await this.reload();
+				}),
+		);
+
+		new Setting(pane).addButton((b) =>
+			b.setButtonText("AI 整理到本记录本（新建）").onClick(async () => {
 				if (!this.meta) return;
 				new Notice("整理中…");
 				const r = await this.plugin.inbox.processOne(path, {
@@ -1063,7 +1219,6 @@ export class NotebookView extends ItemView {
 		if (text == null || !text.trim()) return;
 		await this.enqueueOrSend(text.trim(), []);
 	}
-
 
 	private async ensureThread(): Promise<ChatThread> {
 		if (!this.meta) throw new Error("无记录本");
@@ -1453,11 +1608,12 @@ export class NotebookView extends ItemView {
 				new Notice(warn);
 			} else {
 				const runner = new AssistantActionRunner(
-					this.plugin.items,
-					this.plugin.cabinet,
-					this.plugin.vaultIo,
-					() => this.plugin.settings,
-				);
+						this.plugin.items,
+						this.plugin.cabinet,
+						this.plugin.attachments,
+						this.plugin.vaultIo,
+						() => this.plugin.settings,
+					);
 				const apply = await runner.apply(
 					this.meta,
 					this.blueprint,
@@ -1612,7 +1768,9 @@ export class NotebookView extends ItemView {
 					this.plugin.vaultIo,
 					this.plugin.settings,
 					this.meta.notebook_id,
+					this.meta.name,
 					this.activeItem?.frontmatter.item_id ?? null,
+					this.activeItem?.frontmatter.title ?? null,
 					pending,
 				);
 			} catch (e) {
@@ -1827,13 +1985,60 @@ export class NotebookView extends ItemView {
 		fields?: Record<string, unknown>;
 		body?: string;
 	}): Promise<void> {
-		if (!this.activeItem) return;
+		if (!this.activeItem || !this.meta) return;
+		const prevTitle = this.activeItem.frontmatter.title;
+		const itemId = this.activeItem.frontmatter.item_id;
 		try {
 			this.activeItem = await this.plugin.items.updateItem(
 				this.activeItem,
 				patch,
 			);
-			// refresh list titles without full flicker when possible
+			// Title rename → rename attachment folders + rewrite embeds
+			if (
+				patch.title != null &&
+				patch.title.trim() &&
+				patch.title.trim() !== prevTitle
+			) {
+				try {
+					const rewrites = await this.plugin.attachments.syncItemTitle(
+						this.meta,
+						itemId,
+						patch.title.trim(),
+					);
+					if (rewrites.length) {
+						const nextBody = this.plugin.attachments.rewriteEmbedPaths(
+							this.activeItem.body,
+							rewrites,
+						);
+						if (nextBody !== this.activeItem.body) {
+							this.activeItem = await this.plugin.items.updateItem(
+								this.activeItem,
+								{ body: nextBody },
+							);
+						}
+					}
+				} catch {
+					// keep title even if folder rename fails
+				}
+			}
+			// Body edit may introduce new paste embeds → absorb
+			if (patch.body != null) {
+				try {
+					const { item: next, rewrites } =
+						await this.plugin.attachments.absorbEmbedsInItem(
+							this.meta,
+							this.activeItem,
+						);
+					if (rewrites.length && next.body !== this.activeItem.body) {
+						this.activeItem = await this.plugin.items.updateItem(
+							this.activeItem,
+							{ body: next.body },
+						);
+					}
+				} catch {
+					// ignore absorb failures
+				}
+			}
 			await this.reload();
 		} catch (e) {
 			new Notice(`保存失败: ${e instanceof Error ? e.message : String(e)}`);
@@ -2052,6 +2257,238 @@ export class NotebookView extends ItemView {
 	}
 
 
+	private async renderAttachments(
+		listPane: HTMLElement,
+		detailPane: HTMLElement,
+	): Promise<void> {
+		listPane.empty();
+		detailPane.empty();
+		if (!this.meta) return;
+		const meta = this.meta;
+
+		const addRow = listPane.createDiv({ cls: "ai-notebook-settings-actions" });
+		const importBtn = addRow.createEl("button", { text: "导入文件" });
+		importBtn.addClass("mod-cta");
+		importBtn.addEventListener("click", () => {
+			void this.importAttachmentsFromComputer(listPane, detailPane);
+		});
+		const pickVaultBtn = addRow.createEl("button", { text: "登记库内文件" });
+		pickVaultBtn.addEventListener("click", () => {
+			void this.registerExternalAttachment(listPane, detailPane);
+		});
+
+		const hint = listPane.createDiv({
+			cls: "ai-notebook-empty",
+			text: "附件管理：导入文件会保存到附件目录，并在当前/新建条目正文插入预览。删除附件登记默认不删正文；删正文也不会删附件。",
+		});
+		hint.style.padding = "8px 4px";
+		hint.style.textAlign = "left";
+		hint.style.fontSize = "0.8em";
+
+		const files = await this.plugin.attachments.list(meta);
+		listPane.createEl("h4", { text: `附件（${files.length}）` });
+		if (files.length === 0) {
+			listPane.createDiv({
+				cls: "ai-notebook-empty",
+				text: "暂无附件 — 点「导入文件」或手机上传",
+			});
+		}
+		for (const file of files) {
+			const row = listPane.createDiv({ cls: "ai-notebook-item-row" });
+			row.createDiv({
+				cls: "ai-notebook-item-title",
+				text: file.displayName,
+			});
+			const owner = attachmentOwnerLabel(file, this.items);
+			row.createDiv({
+				cls: "ai-notebook-item-meta",
+				text: `${owner} · ${attachmentKindLabel(file.kind)} · ${file.ownership === "managed" ? "托管" : "外部"}`,
+			});
+			row.createDiv({ cls: "ai-notebook-item-meta", text: file.vaultPath });
+			row.addEventListener("click", () => {
+				this.renderAttachmentDetail(detailPane, file);
+			});
+		}
+
+		detailPane.createDiv({
+			cls: "ai-notebook-empty",
+			text: "选择附件查看操作",
+		});
+	}
+
+	private async importAttachmentsFromComputer(
+		listPane: HTMLElement,
+		detailPane: HTMLElement,
+	): Promise<void> {
+		if (!this.meta) return;
+		const meta = this.meta;
+		const files = await pickLocalFiles({ multiple: true });
+		if (files.length === 0) {
+			new Notice("未选择文件（若已取消可忽略）");
+			return;
+		}
+
+		let ok = 0;
+		let last: AttachmentRecord | null = null;
+		let targetItem = this.activeItem;
+
+		for (const f of files) {
+			try {
+				const data = await f.arrayBuffer();
+				if (!targetItem) {
+					targetItem = await this.plugin.items.createItem(meta, {
+						title: f.name,
+						body: "",
+						fields: { source: "desktop-attachment" },
+					});
+					this.activeItem = targetItem;
+				}
+				const stored = await this.plugin.attachments.importBinary(meta, {
+					displayName: f.name,
+					data,
+					mime: f.type || undefined,
+					item_id: targetItem.frontmatter.item_id,
+					itemName: targetItem.frontmatter.title,
+					kind: "backup",
+					origin: "desktop-import",
+				});
+				const embed = buildAttachmentEmbedMarkdown(stored);
+				targetItem = await this.plugin.items.appendToItem(targetItem, {
+					body: embed,
+					heading: `附件 · ${f.name}`,
+				});
+				this.activeItem = targetItem;
+				ok++;
+				last = stored;
+			} catch (e) {
+				new Notice(
+					`导入 ${f.name} 失败: ${e instanceof Error ? e.message : String(e)}`,
+				);
+			}
+		}
+
+		if (ok > 0) {
+			new Notice(`已导入 ${ok} 个附件并插入正文`);
+			await this.reload();
+			this.leftTab = "attachments";
+			await this.renderAttachments(listPane, detailPane);
+			if (last) this.renderAttachmentDetail(detailPane, last);
+		}
+	}
+
+	private async registerExternalAttachment(
+		listPane: HTMLElement,
+		detailPane: HTMLElement,
+	): Promise<void> {
+		if (!this.meta) return;
+		const meta = this.meta;
+		await new Promise<void>((resolve) => {
+			const modal = new VaultFileSuggestModal(this.app, (file) => {
+				void (async () => {
+					try {
+						const registered = await this.plugin.attachments.registerExternal(
+							meta,
+							{
+								displayName: file.name,
+								vaultPath: file.path,
+								size: file.stat.size,
+								item_id: this.activeItem?.frontmatter.item_id ?? null,
+							},
+						);
+						if (this.activeItem) {
+							const embed = buildAttachmentEmbedMarkdown(registered);
+							this.activeItem = await this.plugin.items.appendToItem(
+								this.activeItem,
+								{
+									body: embed,
+									heading: `附件 · ${file.name}`,
+								},
+							);
+						}
+						new Notice(`已登记附件：${registered.displayName}`);
+						await this.renderAttachments(listPane, detailPane);
+						this.renderAttachmentDetail(detailPane, registered);
+					} catch (e) {
+						new Notice(
+							`登记失败: ${e instanceof Error ? e.message : String(e)}`,
+						);
+					} finally {
+						resolve();
+					}
+				})();
+			});
+			const origClose = modal.onClose.bind(modal);
+			modal.onClose = () => {
+				origClose();
+				resolve();
+			};
+			modal.open();
+		});
+	}
+
+	private renderAttachmentDetail(
+		pane: HTMLElement,
+		file: AttachmentRecord,
+	): void {
+		pane.empty();
+		if (!this.meta) return;
+		const meta = this.meta;
+		pane.createEl("h3", { text: file.displayName });
+		pane.createEl("p", { text: `归属: ${attachmentOwnerLabel(file, this.items)}` });
+		pane.createEl("p", { text: `用途: ${attachmentKindLabel(file.kind)}` });
+		pane.createEl("p", {
+			text: `来源: ${file.ownership === "managed" ? "插件托管" : "外部引用（不会删除原文件）"}`,
+		});
+		if (file.mime) {
+			pane.createEl("p", {
+				cls: "setting-item-description",
+				text: `类型: ${file.mime} · 大小: ${file.size || "?"} 字节`,
+			});
+		}
+		pane.createEl("p", {
+			cls: "setting-item-description",
+			text: file.vaultPath,
+		});
+		new Setting(pane).addButton((b) =>
+			b.setButtonText("在库中打开").onClick(async () => {
+				const af = this.app.vault.getAbstractFileByPath(file.vaultPath);
+				if (af) {
+					await this.app.workspace
+						.getLeaf(true)
+						.openFile(af as import("obsidian").TFile);
+				} else {
+					new Notice("文件不在 vault 中（可能已移动）");
+				}
+			}),
+		);
+		new Setting(pane).addButton((b) =>
+			b.setButtonText("插入到当前条目正文").onClick(async () => {
+				if (!this.activeItem) {
+					new Notice("请先选择一个条目");
+					return;
+				}
+				const embed = buildAttachmentEmbedMarkdown(file);
+				this.activeItem = await this.plugin.items.appendToItem(this.activeItem, {
+					body: embed,
+					heading: `附件 · ${file.displayName}`,
+				});
+				new Notice("已插入正文（附件文件保持独立）");
+				await this.reload();
+				this.leftTab = "attachments";
+				this.render();
+			}),
+		);
+		new Setting(pane).addButton((b) =>
+			b.setButtonText("解除登记（保留文件）").onClick(async () => {
+				if (!confirm("只从附件管理移除登记，保留真实文件和正文？")) return;
+				await this.plugin.attachments.remove(meta, file.id);
+				new Notice("已解除登记，文件与正文已保留");
+				this.leftTab = "attachments";
+				this.render();
+			}),
+		);
+	}
+
 	private async renderCabinet(
 		listPane: HTMLElement,
 		detailPane: HTMLElement,
@@ -2091,14 +2528,14 @@ export class NotebookView extends ItemView {
 			void this.addCabinetFileFromVault(listPane, detailPane);
 		});
 
-		const importBtn = addRow.createEl("button", { text: "从电脑导入" });
+		const importBtn = addRow.createEl("button", { text: "收藏文件（可选）" });
 		importBtn.addEventListener("click", () => {
 			void this.addCabinetFileFromComputer(listPane, detailPane);
 		});
 
 		const hint = listPane.createDiv({
 			cls: "ai-notebook-empty",
-			text: "链接：点「添加链接」。文件：「从库选择」登记 vault 内文件，或「从电脑导入」复制到本记录本附件目录。",
+			text: "收藏柜是可选收藏：链接、收藏的文件引用。普通上传/附件请用「附件」页签。",
 		});
 		hint.style.padding = "8px 4px";
 		hint.style.textAlign = "left";
@@ -2130,7 +2567,7 @@ export class NotebookView extends ItemView {
 		if (files.length === 0) {
 			listPane.createDiv({
 				cls: "ai-notebook-empty",
-				text: "暂无文件 — 点「从库选择文件」或「从电脑导入」",
+				text: "暂无收藏文件 — 普通附件请用「附件」页签；此处仅可选收藏",
 			});
 		}
 		for (const file of files) {
@@ -2139,10 +2576,15 @@ export class NotebookView extends ItemView {
 				cls: "ai-notebook-item-title",
 				text: file.displayName,
 			});
+			const owner = cabinetFileOwnerLabel(file, this.items);
+			row.createDiv({
+				cls: "ai-notebook-item-meta",
+				text: `${owner} · ${cabinetFileKindLabel(file.kind)} · ${file.ownership === "managed" ? "插件托管" : "外部引用"}`,
+			});
 			row.createDiv({ cls: "ai-notebook-item-meta", text: file.vaultPath });
 			row.addEventListener("click", () => {
-				this.renderCabinetDetail(detailPane, { kind: "file", file });
-			});
+					this.renderCabinetDetail(detailPane, { kind: "file", file });
+				});
 		}
 
 		detailPane.empty();
@@ -2190,6 +2632,8 @@ export class NotebookView extends ItemView {
 								displayName: file.name,
 								vaultPath: file.path,
 								size: file.stat.size,
+								item_id: this.activeItem?.frontmatter.item_id ?? null,
+							itemName: this.activeItem?.frontmatter.title ?? null,
 							},
 						);
 						new Notice(`已登记：${registered.displayName}`);
@@ -2236,6 +2680,10 @@ export class NotebookView extends ItemView {
 					displayName: f.name,
 					data,
 					mime: f.type || undefined,
+					item_id: this.activeItem?.frontmatter.item_id ?? null,
+					itemName: this.activeItem?.frontmatter.title ?? null,
+					kind: "backup",
+					origin: "desktop-import",
 				});
 				ok++;
 				last = registered;
@@ -2246,7 +2694,7 @@ export class NotebookView extends ItemView {
 			}
 		}
 		if (ok > 0) {
-			new Notice(`已导入 ${ok} 个文件到附件目录并登记`);
+			new Notice(`已收藏导入 ${ok} 个文件（可选收藏柜，非附件管理）`);
 			await this.renderCabinet(listPane, detailPane);
 			if (last) {
 				this.renderCabinetDetail(detailPane, { kind: "file", file: last });
@@ -2281,7 +2729,7 @@ export class NotebookView extends ItemView {
 				b.setButtonText("删除").setWarning().onClick(async () => {
 					if (!confirm("删除该链接？")) return;
 					await this.plugin.cabinet.removeLink(meta, link.id);
-					new Notice("已删除");
+					new Notice("链接已删除");
 					this.leftTab = "cabinet";
 					await this.reload();
 					this.leftTab = "cabinet";
@@ -2292,7 +2740,13 @@ export class NotebookView extends ItemView {
 		}
 		const { file } = target;
 		pane.createEl("h3", { text: file.displayName });
-		pane.createEl("p", { text: file.vaultPath });
+		const owner = cabinetFileOwnerLabel(file, this.items);
+		pane.createEl("p", { text: `归属: ${owner}` });
+		pane.createEl("p", { text: `用途: ${cabinetFileKindLabel(file.kind)}` });
+		pane.createEl("p", {
+			text: `来源: ${file.ownership === "managed" ? "插件托管备份" : "外部引用（不会删除原文件）"}`,
+		});
+
 		if (file.mime) {
 			pane.createEl("p", {
 				cls: "setting-item-description",
@@ -2310,10 +2764,10 @@ export class NotebookView extends ItemView {
 			}),
 		);
 		new Setting(pane).addButton((b) =>
-			b.setButtonText("删除文件记录").setWarning().onClick(async () => {
-				if (!confirm("删除该文件记录（并尝试删除 vault 文件）？")) return;
+			b.setButtonText("解除登记（保留文件）").onClick(async () => {
+				if (!confirm("只从收藏柜移除登记，保留真实文件和原笔记？")) return;
 				await this.plugin.cabinet.removeFile(meta, file.id);
-				new Notice("已删除");
+				new Notice("已解除登记，文件已保留");
 				this.leftTab = "cabinet";
 				this.render();
 			}),
@@ -2410,6 +2864,28 @@ export class NotebookView extends ItemView {
 
 
 
+function cabinetFileOwnerLabel(file: CabinetFile, items: NotebookItem[]): string {
+	const byId = file.item_id
+		? items.find((item) => item.frontmatter.item_id === file.item_id)
+		: undefined;
+	if (byId) return `条目：${byId.frontmatter.title}`;
+	const byRef = items.find((item) => item.frontmatter.cabinet_refs.includes(file.id));
+	if (byRef) return `条目：${byRef.frontmatter.title}`;
+	if (file.item_id) return `条目已不存在：${file.item_id.slice(0, 8)}`;
+	return "未关联条目";
+}
+
+function cabinetFileKindLabel(kind: CabinetFileKind): string {
+	const labels: Record<CabinetFileKind, string> = {
+		backup: "备份",
+		voice: "语音",
+		chat: "聊天上传",
+		embedded: "正文附件",
+		unknown: "未分类",
+	};
+	return labels[kind];
+}
+
 function formatItemTime(item: NotebookItem): string {
 	const raw =
 		item.frontmatter.updated ||
@@ -2418,6 +2894,7 @@ function formatItemTime(item: NotebookItem): string {
 	const label = formatDateTimeLocal(String(raw));
 	return label ? `更新 ${label}` : "";
 }
+
 
 function formatCell(value: unknown): string {
 	if (value == null) return "";
@@ -2519,3 +2996,28 @@ function mediaKindFromPath(
 	return "other";
 }
 
+
+
+function attachmentOwnerLabel(file: AttachmentRecord, items: NotebookItem[]): string {
+	if (file.item_id) {
+		const byId = items.find((item) => item.frontmatter.item_id === file.item_id);
+		if (byId) return byId.frontmatter.title || file.item_id;
+		return file.item_id;
+	}
+	return "未关联条目";
+}
+
+function attachmentKindLabel(kind: AttachmentKind): string {
+	switch (kind) {
+		case "backup":
+			return "备份";
+		case "voice":
+			return "语音";
+		case "chat":
+			return "对话";
+		case "embedded":
+			return "正文嵌入";
+		default:
+			return "其他";
+	}
+}

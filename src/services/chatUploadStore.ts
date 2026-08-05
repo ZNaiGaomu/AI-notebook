@@ -3,7 +3,7 @@
  * Supports vault-relative paths OR absolute OS paths (user-chosen folder).
  */
 import type { AiNotebookSettings } from "../domain/types";
-import { chatUploadsDir, joinPath } from "../infra/paths";
+import { joinPath, structuredChatUploadsDir } from "../infra/paths";
 import { isAbsoluteFsPath } from "../infra/folderPick";
 import type { IVaultFs } from "../infra/vaultPort";
 import type { PendingChatFile } from "./assistantActions";
@@ -13,12 +13,20 @@ export async function persistChatUpload(
 	vault: IVaultFs,
 	settings: AiNotebookSettings,
 	notebookId: string,
+	notebookName: string,
 	itemId: string | null,
+	itemName: string | null,
 	file: PendingChatFile,
 ): Promise<PendingChatFile> {
 	if (file.vaultPath) return file;
 
-	const destDir = chatUploadsDir(settings, notebookId, itemId);
+	const destDir = structuredChatUploadsDir(
+		settings,
+		notebookId,
+		notebookName,
+		itemId,
+		itemName,
+	);
 	const safe = sanitize(file.name);
 	const unique = await uniqueName(safe, async (n) =>
 		pathExists(vault, joinPath(destDir, n)),

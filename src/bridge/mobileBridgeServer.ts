@@ -14,6 +14,10 @@ import type { OrganizeService } from "../services/organizeService";
 import type { VoiceService } from "../services/voiceService";
 import type { ItemService } from "../services/itemService";
 import type { CabinetService } from "../services/cabinetService";
+import type { AttachmentService } from "../services/attachmentService";
+import {
+	buildAttachmentEmbedMarkdown,
+} from "../services/attachmentService";
 import { buildMobilePageHtml } from "./mobilePageHtml";
 
 export type BridgeDeps = {
@@ -40,6 +44,8 @@ export type BridgeDeps = {
 	voice: VoiceService;
 	items: ItemService;
 	cabinet: CabinetService;
+	/** Ordinary uploads use attachments, not cabinet. */
+	attachments: AttachmentService;
 	onNoteWritten?: (info: { title: string; path: string }) => void;
 };
 
@@ -711,148 +717,147 @@ export class MobileBridgeServer {
 		const mime = String(body.mimeType ?? "application/octet-stream");
 		const notebookId = pickNotebookId(body);
 		const itemId = pickItemId(body);
-		const meta = itemId
-			? await this.resolveStrictNotebook(notebookId)
-			: await this.deps.resolveNotebookById(notebookId);
+		const organize =
+			body.organize === undefined ? true : Boolean(body.organize);
 		const buf = Buffer.from(b64, "base64");
-		const ab = buf.buffer.slice(
-			buf.byteOffset,
-			buf.byteOffset + buf.byteLength,
-		) as ArrayBuffer;
 		const noteTitle = String(body.title ?? fileName)
 			.replace(/^mobile file:\s*/i, "")
 			.slice(0, 80);
 
+		if (!organize) {
+			const abInbox = buf.buffer.slice(
+				buf.byteOffset,
+				buf.byteOffset + buf.byteLength,
+			) as ArrayBuffer;
+			const dumped = await this.deps.inbox.dumpBinary({
+				fileName,
+				data: abInbox,
+				mime,
+				source: "mobile",
+				title: noteTitle,
+				note: body.note ? String(body.note) : "",
+			});
+			this.pushRecent({
+				title: noteTitle,
+				preview: `${fileName}（收件箱文件）`,
+				path: dumped.notePath,
+				organized: false,
+				at: new Date().toISOString(),
+			});
+			this.json(res, 200, {
+				ok: true,
+				path: dumped.notePath,
+				filePath: dumped.filePath,
+				inboxOnly: true,
+				organized: false,
+			});
+			return;
+		}
+
+const meta = itemId
+			? await this.resolveStrictNotebook(notebookId)
+			: await this.deps.resolveNotebookById(notebookId);
+		const ab = buf.buffer.slice(
+			buf.byteOffset,
+			buf.byteOffset + buf.byteLength,
+		) as ArrayBuffer;
+
 		if (!meta) {
-			const path = await this.deps.inbox.dumpRaw({
-				text: [
-					`# ${noteTitle}`,
-					"",
-					`手机上传（尚无记录本，仅文字说明）：${fileName}`,
-					`类型：${mime}`,
-					`大小：${buf.length} 字节`,
-				].join("\n"),
+			const dumped = await this.deps.inbox.dumpBinary({
+				fileName,
+				data: ab,
+				mime,
 				source: "mobile",
 				title: noteTitle,
 			});
 			this.pushRecent({
 				title: noteTitle,
 				preview: fileName,
-				path,
+				path: dumped.notePath,
 				organized: false,
 				at: new Date().toISOString(),
 			});
 			this.json(res, 200, {
 				ok: true,
-				path,
+				path: dumped.notePath,
+				filePath: dumped.filePath,
 				organized: false,
-				warning: "无记录本：未保存二进制，仅写入收件箱说明",
+				warning: "无记录本：文件已进收件箱，待选择记录本整理",
 			});
 			return;
 		}
-		const targetItem = itemId ? await this.deps.items.findById(meta, itemId) : null;
+		const targetItem = itemId
+			? await this.deps.items.findById(meta, itemId)
+			: null;
 		if (itemId && !targetItem) {
 			this.json(res, 404, { ok: false, error: "条目不存在" });
 			return;
 		}
 
-		// 1) Write real binary into vault attachments + cabinet index
-		const stored = await this.deps.cabinet.importBinary(meta, {
+		// Create/resolve item first so attachment lands under final item path.
+		let item = targetItem;
+		let created = false;
+		if (!item) {
+			item = await this.deps.items.createItem(meta, {
+				title: noteTitle || fileName,
+				body: body.note ? String(body.note) : "",
+				capturedAt: pickCapturedAt(body),
+				fields: {
+					source: "mobile-web-file",
+					url: "",
+				},
+			});
+			created = true;
+		}
+
+		const stored = await this.deps.attachments.importBinary(meta, {
 			displayName: fileName,
 			data: ab,
 			mime,
+			item_id: item.frontmatter.item_id,
+			itemName: item.frontmatter.title,
+			kind: "backup",
+			origin: "mobile-upload",
 		});
 
-		// 2) Note body embeds the file so Obsidian can preview image/video/pdf
-		const embed = mediaEmbedMarkdown(stored.vaultPath, mime);
-		const noteBody = [
-			embed,
-			"",
-			body.note ? String(body.note) : "",
-			"",
-			`文件：\`${fileName}\``,
-			`类型：${mime}`,
-			`大小：${buf.length} 字节`,
-			`路径：\`${stored.vaultPath}\``,
+		const noteExtra = body.note ? String(body.note).trim() : "";
+		const embedBlock = [
+			noteExtra && !created ? noteExtra : "",
+			buildAttachmentEmbedMarkdown(stored, {
+				caption: `${fileName} · ${mime} · ${buf.length} 字节`,
+			}),
 		]
-			.filter((x) => x !== "")
-			.join("\n");
+			.filter(Boolean)
+			.join(String.fromCharCode(10, 10));
 
-		if (targetItem) {
-			const refs = targetItem.frontmatter.cabinet_refs || [];
-			const nextRefs = refs.includes(stored.id) ? refs : [...refs, stored.id];
-			const updated = await this.deps.items.appendToItem(targetItem, {
-				body: noteBody,
-				heading: `追加文件 · ${fileName}`,
-				fields: { cabinet_refs: nextRefs },
-			});
-			this.pushRecent({
-				title: updated.frontmatter.title,
-				preview: fileName,
-				path: updated.path,
-				organized: false,
-				at: new Date().toISOString(),
-			});
-			this.deps.onNoteWritten?.({
-				title: updated.frontmatter.title,
-				path: updated.path,
-			});
-			this.json(res, 200, {
-				ok: true,
-				appended: true,
-				itemId: updated.frontmatter.item_id,
-				title: updated.frontmatter.title,
-				path: updated.path,
-				vaultPath: stored.vaultPath,
-				fileName,
-				size: buf.length,
-				mime,
-				organized: false,
-			});
-			return;
-		}
-
-		const item = await this.deps.items.createItem(meta, {
-			title: noteTitle || fileName,
-			body: noteBody,
-			capturedAt: pickCapturedAt(body),
-			fields: {
-				source: "mobile-web-file",
-				url: "",
-			},
-		});
-
-		// link cabinet file to item when possible
-		try {
-			if (stored.item_id !== item.frontmatter.item_id) {
-				// re-register is not needed; update refs on item
-				const refs = item.frontmatter.cabinet_refs || [];
-				if (!refs.includes(stored.id)) {
-					await this.deps.items.updateItem(item, {
-						fields: { cabinet_refs: [...refs, stored.id] },
-					});
-				}
-			}
-		} catch {
-			// non-fatal
-		}
+		const updated = created
+			? await this.deps.items.updateItem(item, {
+					body: [item.body, embedBlock].filter(Boolean).join(String.fromCharCode(10, 10)),
+			  })
+			: await this.deps.items.appendToItem(item, {
+					body: embedBlock,
+					heading: `附件 · ${fileName}`,
+			  });
 
 		this.pushRecent({
-			title: item.frontmatter.title,
+			title: updated.frontmatter.title,
 			preview: fileName,
-			path: item.path,
+			path: updated.path,
 			organized: false,
 			at: new Date().toISOString(),
 		});
 		this.deps.onNoteWritten?.({
-			title: item.frontmatter.title,
-			path: item.path,
+			title: updated.frontmatter.title,
+			path: updated.path,
 		});
 		this.json(res, 200, {
 			ok: true,
-			title: item.frontmatter.title,
-			path: item.path,
+			appended: !created,
+			itemId: updated.frontmatter.item_id,
+			title: updated.frontmatter.title,
+			path: updated.path,
 			vaultPath: stored.vaultPath,
+			attachmentId: stored.id,
 			fileName,
 			size: buf.length,
 			mime,

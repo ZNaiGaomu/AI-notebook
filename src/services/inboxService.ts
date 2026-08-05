@@ -5,12 +5,17 @@ import {
 	serializeFrontmatter,
 } from "../infra/frontmatter";
 import {
+	inboxFilesDir,
 	inboxPendingDir,
 	inboxProcessedDir,
 	inboxRoot,
 	inboxVoiceDir,
 	joinPath,
 } from "../infra/paths";
+import type { AttachmentService } from "./attachmentService";
+import { buildAttachmentEmbedMarkdown } from "./attachmentService";
+import type { ItemService } from "./itemService";
+import type { NotebookItem } from "../domain/types";
 import type { IVaultFs } from "../infra/vaultPort";
 import type { OrganizeService } from "./organizeService";
 import type { NotebookService } from "./notebookService";
@@ -30,6 +35,9 @@ export type InboxListItem = {
  * Desktop (or mobile with plugin) processes them into notebooks via AI.
  */
 export class InboxService {
+	attachments: AttachmentService | null = null;
+	items: ItemService | null = null;
+
 	constructor(
 		private readonly vault: IVaultFs,
 		private readonly notebooks: NotebookService,
@@ -43,6 +51,7 @@ export class InboxService {
 		await this.vault.ensureFolder(inboxPendingDir(s));
 		await this.vault.ensureFolder(inboxProcessedDir(s));
 		await this.vault.ensureFolder(inboxVoiceDir(s));
+		await this.vault.ensureFolder(inboxFilesDir(s));
 
 		const readme = joinPath(inboxRoot(s), "如何用手机投递.md");
 		if (!(await this.vault.exists(readme))) {
@@ -148,7 +157,64 @@ export class InboxService {
 		return path;
 	}
 
-	async resolveTargetNotebook(): Promise<NotebookMeta | null> {
+		/** Save binary file under inbox/files and create a pending note with embed. */
+	async dumpBinary(input: {
+		fileName: string;
+		data: ArrayBuffer;
+		mime?: string;
+		source?: "mobile" | "paste" | "share" | "unknown";
+		title?: string;
+		note?: string;
+	}): Promise<{ notePath: string; filePath: string }> {
+		await this.ensureStructure();
+		const s = this.getSettings();
+		const id = shortId(createId(), 8);
+		const safeName = (input.fileName || "file.bin")
+			.replace(/[\\/:*?"<>|]/g, "-")
+			.trim() || "file.bin";
+		const filePath = joinPath(inboxFilesDir(s), `${todayDatePrefix()}-${id}-${safeName}`);
+		if (!this.vault.writeBinary) {
+			throw new Error("当前存储不支持二进制写入");
+		}
+		await this.vault.writeBinary(filePath, input.data);
+		const title =
+			input.title?.trim() ||
+			safeName.replace(/\.[^.]+$/, "") ||
+			"手机文件";
+		const notePath = joinPath(
+			inboxPendingDir(s),
+			`${todayDatePrefix()}-${id}.md`,
+		);
+		const mime = input.mime || "application/octet-stream";
+		const body = [
+			input.note?.trim() || "",
+			`![[${filePath}]]`,
+			"",
+			`文件：\`${safeName}\``,
+			`类型：${mime}`,
+			`大小：${input.data.byteLength} 字节`,
+			"",
+			"> 收件箱已保存原文件，整理进记录本后可在条目中预览/播放。",
+		]
+			.filter((x) => x !== "")
+			.join("\n");
+		const content = serializeFrontmatter(
+			{
+				ai_inbox: true,
+				source: input.source ?? "mobile",
+				title,
+				created: nowIso(),
+				status: "pending",
+				inbox_file: filePath,
+				mime,
+			},
+			body.endsWith("\n") ? body : `${body}\n`,
+		);
+		await this.vault.write(notePath, content);
+		return { notePath, filePath };
+	}
+
+async resolveTargetNotebook(): Promise<NotebookMeta | null> {
 		const s = this.getSettings();
 		const id =
 			s.inbox.defaultNotebookId || s.ui.lastNotebookId || null;
@@ -165,9 +231,23 @@ export class InboxService {
 	 */
 	async processOne(
 		path: string,
-		opts?: { notebook?: NotebookMeta; useAi?: boolean },
+		opts?: {
+			notebook?: NotebookMeta;
+			useAi?: boolean;
+			/** Append into this existing item instead of creating a new one. */
+			targetItemId?: string | null;
+			/** Create new item when target missing (default true). */
+			createIfMissing?: boolean;
+		},
 	): Promise<
-		| { ok: true; itemPath: string; notebookName: string; organized: boolean }
+		| {
+				ok: true;
+				itemPath: string;
+				notebookName: string;
+				organized: boolean;
+				appended?: boolean;
+				itemId?: string;
+		  }
 		| { ok: false; error: string }
 	> {
 		const meta = opts?.notebook ?? (await this.resolveTargetNotebook());
@@ -191,12 +271,99 @@ export class InboxService {
 			.trim();
 		if (!text) return { ok: false, error: "收件内容为空" };
 
-		const captured = await this.organize.captureStructured(meta, text, {
-			useAi: opts?.useAi !== false,
-			source: String(frontmatter.source ?? "mobile"),
-			inboxPath: path,
-			sourceHint: "来自收件箱/手机投递",
-		});
+		const inboxFile =
+			typeof frontmatter.inbox_file === "string"
+				? frontmatter.inbox_file.trim()
+				: "";
+		const targetItemId = opts?.targetItemId?.trim() || null;
+		let item: NotebookItem | null = null;
+		let organized = false;
+		let appended = false;
+
+		if (targetItemId && this.items) {
+			item = await this.items.findById(meta, targetItemId);
+			if (!item && opts?.createIfMissing === false) {
+				return { ok: false, error: "目标条目不存在" };
+			}
+		}
+
+		if (item && this.items) {
+			// Direct append into chosen item (optionally AI-polished body)
+			let addition = text;
+			if (opts?.useAi !== false) {
+				const result = await this.organize.organizeText(meta, text, {
+					sourceHint: "来自收件箱/手机投递",
+				});
+				if (result.ok) {
+					addition = result.summary
+						? `> ${result.summary}\n\n${result.body}`
+						: result.body;
+					organized = true;
+				}
+			}
+			// keep embeds from original inbox note
+			const embeds = text.match(/!\[\[[^\]]+\]\]/g) ?? [];
+			for (const e of embeds) {
+				if (!addition.includes(e)) {
+					addition = `${addition.trimEnd()}\n\n${e}`;
+				}
+			}
+			item = await this.items.appendToItem(item, {
+				body: addition,
+				heading: organized ? "收件箱整理" : "收件箱追加",
+			});
+			appended = true;
+		} else {
+			const captured = await this.organize.captureStructured(meta, text, {
+				useAi: opts?.useAi !== false,
+				source: String(frontmatter.source ?? "mobile"),
+				inboxPath: path,
+				sourceHint: "来自收件箱/手机投递",
+				preserveEmbedsFrom: text,
+			});
+			item = captured.item;
+			organized = captured.organized;
+		}
+
+		// Move inbox binary into attachment management for the item
+		if (item && this.attachments && inboxFile) {
+			try {
+				const absorbed = await this.attachments.absorbVaultFile(meta, {
+					vaultPath: inboxFile,
+					item_id: item.frontmatter.item_id,
+					itemName: item.frontmatter.title,
+					kind: "backup",
+					origin: "inbox-file",
+					mime: String(frontmatter.mime ?? ""),
+				});
+				if (absorbed && this.items) {
+					const rewritten = this.attachments.rewriteEmbedPaths(item.body, [
+						{ from: absorbed.from, to: absorbed.to },
+					]);
+					// ensure embed present
+					let body = rewritten;
+					if (!body.includes(absorbed.to)) {
+						body = `${body.trimEnd()}\n\n${buildAttachmentEmbedMarkdown(absorbed.record)}`;
+					}
+					if (body !== item.body) {
+						item = await this.items.updateItem(item, { body });
+					}
+				}
+			} catch {
+				// keep inbox file if absorb fails
+			}
+		} else if (item && this.attachments && this.items) {
+			// Absorb any other embeds referenced by the note
+			try {
+				const { item: next, rewrites } =
+					await this.attachments.absorbEmbedsInItem(meta, item);
+				if (rewrites.length && next.body !== item.body) {
+					item = await this.items.updateItem(item, { body: next.body });
+				}
+			} catch {
+				// ignore
+			}
+		}
 
 		const s = this.getSettings();
 		if (s.inbox.archiveAfterOrganize) {
@@ -214,9 +381,11 @@ export class InboxService {
 
 		return {
 			ok: true,
-			itemPath: captured.item.path,
+			itemPath: item.path,
 			notebookName: meta.name,
-			organized: captured.organized,
+			organized,
+			appended,
+			itemId: item.frontmatter.item_id,
 		};
 	}
 

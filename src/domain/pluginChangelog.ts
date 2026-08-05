@@ -206,6 +206,61 @@ export const PLUGIN_CAPABILITY_LOG: PluginCapabilityEntry[] = [
 		releasedAt: "2026-07-25",
 		category: "voice",
 	},
+
+		{
+			id: "cap-0.4.0-manual-items-tailscale",
+			pluginVersion: "0.4.0",
+			title: "手工条目吸收 + Tailscale 手机入口",
+			summary: "items 手工文件自动成条目；手机 Tailscale 虚拟局域网入口更稳",
+			details: [
+				"items 下手工 Markdown / 非 Markdown 文件可被吸收为条目",
+				"Tailscale 100.x 地址单独列出，手机远程写入更稳",
+			],
+			releasedAt: "2026-07-28",
+			category: "bridge",
+		},
+		{
+			id: "cap-0.5.0-mobile-targeted-writes",
+			pluginVersion: "0.5.0",
+			title: "手机端定向写入已有条目",
+			summary: "手机可选记录本/条目；文字、语音、文件可追加到目标正文末尾",
+			details: [
+				"手机网页选择已有条目并追加正文",
+				"手机端新建记录本与命名条目",
+				"待发送队列保留记录本/条目目标",
+			],
+			releasedAt: "2026-07-29",
+			category: "bridge",
+		},
+		{
+			id: "cap-0.6.0-attachment-system",
+			pluginVersion: "0.6.0",
+			title: "独立附件管理与标题目录",
+			summary: "附件与收藏柜分离；按条目标题分类；改名同步；正文嵌入与删除互不影响",
+			details: [
+				"AttachmentService + AI Notebooks/<本>/attachments/index.json",
+				"物理路径：attachments/ai-notebook/{记录本标题}/items/{条目标题}/",
+				"条目改名时重命名附件目录，并尽量修正正文 ![[旧路径]]",
+				"正文粘贴/拖入媒体可自动吸入对应条目附件目录",
+				"默认解除登记不删实体文件，不改正文",
+			],
+			releasedAt: "2026-08-05",
+			category: "core",
+		},
+		{
+			id: "cap-0.6.0-inbox-media-organize",
+			pluginVersion: "0.6.0",
+			title: "收件箱跨本整理 + 媒体可预览",
+			summary: "收件箱可选记录本/已有条目；文件收件箱保存二进制并在整理后可看图/听音",
+			details: [
+				"收件箱详情：目标记录本、目标条目、AI 开关、直接整理",
+				"仅收件箱文件走 dumpBinary（AI Inbox/files + ![[embed]]）",
+				"整理时把收件箱媒体吸入附件管理并保留正文预览",
+				"AI 整理强制保留 Obsidian 媒体嵌入",
+			],
+			releasedAt: "2026-08-05",
+			category: "inbox",
+		}
 ];
 
 export function listPluginCapabilitiesNewestFirst(): PluginCapabilityEntry[] {
