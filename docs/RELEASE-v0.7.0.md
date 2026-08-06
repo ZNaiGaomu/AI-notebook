@@ -7,7 +7,9 @@
 GitHub Release 页面提供两个独立下载文件：
 
 - `ai-notebook-v0.7.0.zip`：Obsidian 插件安装包，只含 `manifest.json`、`main.js`、`styles.css`
-- `suji-v0.7.0-release-unsigned.apk`：Android 10+ 安装包，当前为未签名 Release 构建，适合侧载测试
+- `suji-v0.7.0-preview.apk`：Android 10+ 可安装 Preview 包，使用测试签名，适合侧载体验
+
+> Preview APK 与未来正式签名版本的签名证书不同。若 Android 拒绝覆盖安装未来正式版，请先卸载 Preview；卸载会清除 App 本地队列和手机副本，请先发送或备份需要保留的内容。
 
 Tag 的 Source code 压缩包包含完整源码和 Android 工程，不是插件安装包。
 

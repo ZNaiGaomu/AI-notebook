@@ -27,9 +27,9 @@ Android 客户端：对齐电脑 Obsidian 插件「手机网页入口」的采�
 
 第七版 Release 页面提供独立 Android 安装包：
 
-`suji-v0.7.0-release-unsigned.apk`
+`suji-v0.7.0-preview.apk`
 
-这是未签名 Release 构建，适合 Android 10+ 侧载测试。正式分发前应替换为使用项目签名密钥构建的 APK/AAB。安装包不会包含在 Git 源码提交中，源码工程仍保留在本目录。
+这是使用 Android 测试密钥签名的可安装 Preview 构建，适合 Android 10+ 侧载体验。它不是正式生产签名包；未来切换到正式签名版本时，Android 可能要求先卸载 Preview，卸载会清除 App 本地队列和手机副本。安装包不会包含在 Git 源码提交中，源码工程仍保留在本目录。
 
 ## 使用步骤
 

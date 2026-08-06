@@ -89,7 +89,7 @@
 [GitHub Releases](https://github.com/ZNaiGaomu/AI-notebook/releases/latest) 同时提供两个独立附件：
 
 - `ai-notebook-v0.7.0.zip`：Obsidian 插件安装包，只含 `manifest.json`、`main.js`、`styles.css`
-- `suji-v0.7.0-release-unsigned.apk`：Android 安装包；当前为未签名 Release 构建，适合侧载测试
+- `suji-v0.7.0-preview.apk`：Android 10+ 可安装 Preview 包；使用测试签名，适合侧载体验
 
 > Tag 的 Source code ZIP 是完整开发源码，不是插件安装包。Android 源码位于 `release/app/`。
 
