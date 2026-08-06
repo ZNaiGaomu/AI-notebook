@@ -1,3 +1,12 @@
+import { itemDisplayName } from "../services/itemDisplayName";
+import {
+	applyRetranscribeToBody,
+	buildVoiceBlock,
+	itemBasename,
+	retranscribeVaultAudio,
+	voiceBlockEnd,
+	voiceBlockStart,
+} from "../services/voiceRetranscribe";
 import {
 	ItemView,
 	Notice,
@@ -161,6 +170,19 @@ export class NotebookView extends ItemView {
 				this.viewModeInitialized = true;
 			}
 			this.items = await this.plugin.items.listItems(meta);
+			const migrated = await this.plugin.attachments.migrateItemFolders(
+				meta,
+				this.items,
+			);
+			if (migrated.size) {
+				for (const item of this.items) {
+					const rewrites = migrated.get(item.frontmatter.item_id);
+					if (!rewrites?.length) continue;
+					const body = this.plugin.attachments.rewriteEmbedPaths(item.body, rewrites);
+					if (body !== item.body) await this.plugin.items.updateItem(item, { body });
+				}
+				this.items = await this.plugin.items.listItems(meta);
+			}
 			if (this.activeItem) {
 				this.activeItem =
 					this.items.find(
@@ -298,10 +320,11 @@ export class NotebookView extends ItemView {
 						: this.blueprint?.ui.homePrompt ?? "向助手提问…",
 				getNotebookLabel: () => this.meta?.name ?? "未选择记录本",
 				getItemLabel: () =>
-					this.activeItem?.frontmatter.title?.trim() ||
-					(this.activeItem
-						? this.activeItem.frontmatter.item_id.slice(0, 8)
-						: "未选中条目"),
+						(this.activeItem
+							? itemBasename(this.activeItem.path) ||
+								this.activeItem.frontmatter.title?.trim() ||
+								this.activeItem.frontmatter.item_id.slice(0, 8)
+							: "未选中条目"),
 				onPickNotebook: () => {
 					void new ChatPickNotebookModal(
 						this.app,
@@ -531,23 +554,54 @@ export class NotebookView extends ItemView {
 
 	private async recordAndTranscribe(): Promise<void> {
 		if (!this.meta) return;
+		// Load item list for target picker
+		let itemOptions: Array<{ id: string; title: string }> = [];
+		try {
+			const items = await this.plugin.items.listItems(this.meta);
+			itemOptions = items.map((it) => ({
+				id: it.frontmatter.item_id,
+				title: itemBasename(it.path) || it.frontmatter.title || "未命名",
+			}));
+		} catch {
+			itemOptions = [];
+		}
+		const defaultTarget =
+			this.activeItem?.frontmatter.item_id &&
+			itemOptions.some((o) => o.id === this.activeItem!.frontmatter.item_id)
+				? this.activeItem.frontmatter.item_id
+				: "";
 		const modal = new VoiceRecordModal(
 			this.app,
 			this.plugin.settings.voice?.recordFormat ?? "auto",
+			itemOptions,
+			defaultTarget,
 		);
 		const recorded = await modal.waitForResult();
+		const appendToItemId = modal.getSelectedTargetId().trim();
 		if (!recorded.ok) {
 			if (recorded.cancelled) return;
 			if (recorded.error.startsWith("TEXT_FALLBACK:")) {
 				const text = recorded.error.slice("TEXT_FALLBACK:".length);
-				await this.createFromTranscript(text, { sourceLabel: "文字补充" });
+				if (appendToItemId) {
+					await this.appendTranscriptToItem(appendToItemId, text, {
+						sourceLabel: "文字补充",
+					});
+				} else {
+					await this.createFromTranscript(text, { sourceLabel: "文字补充" });
+				}
 				return;
 			}
 			const text = window.prompt(
 				`录音不可用：${recorded.error}\n\n可改为输入/粘贴文字：`,
 			);
 			if (!text?.trim()) return;
-			await this.createFromTranscript(text.trim(), { sourceLabel: "文字补充" });
+			if (appendToItemId) {
+				await this.appendTranscriptToItem(appendToItemId, text.trim(), {
+					sourceLabel: "文字补充",
+				});
+			} else {
+				await this.createFromTranscript(text.trim(), { sourceLabel: "文字补充" });
+			}
 			return;
 		}
 
@@ -578,16 +632,15 @@ export class NotebookView extends ItemView {
 			return;
 		}
 
-		// Keep note body stable — progress only in corner chip
-		const pendingBody = [
-			"## 转写",
-			"",
-			"> ⏳ 转写处理中…（进度见进度浮条）",
-			"",
+		// One path-addressable block; progress UI stays in the corner chip.
+		const pendingBody = buildVoiceBlock({
+			vaultPath,
 			embedMarkdown,
-		].join("\n");
+			pending: true,
+		});
 
 		let pendingItem: import("../domain/types").NotebookItem | null = null;
+		let appendMode = false;
 		try {
 			if (!this.blueprint) {
 				const { blueprint } = await this.plugin.versions.loadCurrentBlueprint(
@@ -596,16 +649,41 @@ export class NotebookView extends ItemView {
 				this.blueprint = blueprint;
 				this.plugin.runtime.load(blueprint);
 			}
-			pendingItem = await this.plugin.items.createItem(this.meta, {
-				title,
-				body: pendingBody,
-				entityType: this.plugin.runtime.primaryEntityId() ?? undefined,
-				fields: {
-					source: "voice",
-					transcribe_status: "pending",
-					audio_path: vaultPath,
-				},
-			});
+
+			if (appendToItemId) {
+				const existing = await this.plugin.items.findById(
+					this.meta,
+					appendToItemId,
+				);
+				if (existing) {
+					appendMode = true;
+					pendingItem = await this.plugin.items.appendToItem(existing, {
+						body: buildVoiceBlock({
+							vaultPath,
+							embedMarkdown,
+							pending: true,
+						}),
+						fields: {
+							source: "voice",
+							transcribe_status: "pending",
+							audio_path: vaultPath,
+						},
+					});
+				}
+			}
+
+			if (!pendingItem) {
+				pendingItem = await this.plugin.items.createItem(this.meta, {
+					title,
+					body: pendingBody,
+					entityType: this.plugin.runtime.primaryEntityId() ?? undefined,
+					fields: {
+						source: "voice",
+						transcribe_status: "pending",
+						audio_path: vaultPath,
+					},
+				});
+			}
 			try {
 				const voiceFile = await this.plugin.attachments.registerManaged(
 					this.meta,
@@ -626,6 +704,7 @@ export class NotebookView extends ItemView {
 					pendingItem.frontmatter.item_id,
 					pendingItem.frontmatter.title,
 				);
+				const previousVaultPath = vaultPath;
 				if (assigned.vaultPath !== vaultPath) {
 					vaultPath = assigned.vaultPath;
 					const { buildEmbedMarkdown } = await import(
@@ -633,17 +712,26 @@ export class NotebookView extends ItemView {
 					);
 					embedMarkdown = buildEmbedMarkdown(vaultPath);
 				}
-				pendingItem = await this.plugin.items.updateItem(pendingItem, {
-					body: [
-						"## 转写",
-						"",
-						"> ⏳ 转写处理中…（进度见进度浮条）",
-						"",
+				let body = pendingItem.body || "";
+				if (previousVaultPath && vaultPath !== previousVaultPath) {
+					body = body
+						.split(previousVaultPath)
+						.join(vaultPath)
+						.split(voiceBlockStart(previousVaultPath))
+						.join(voiceBlockStart(vaultPath))
+						.split(voiceBlockEnd(previousVaultPath))
+						.join(voiceBlockEnd(vaultPath));
+				}
+				if (!body.includes(voiceBlockStart(vaultPath))) {
+					body = buildVoiceBlock({
+						vaultPath,
 						embedMarkdown,
-					].join("\n"),
-					fields: {
-						audio_path: vaultPath,
-					},
+						pending: true,
+					});
+				}
+				pendingItem = await this.plugin.items.updateItem(pendingItem, {
+					body,
+					fields: { audio_path: vaultPath },
 				});
 			} catch {
 				// keep the safely saved audio and note if attachment registration fails
@@ -651,7 +739,11 @@ export class NotebookView extends ItemView {
 			this.activeItem = pendingItem;
 			this.leftTab = "items";
 			await this.reload();
-			chip.set("已写入笔记 · 转写中…");
+			chip.set(
+				appendMode
+					? "已追加到条目 · 转写中…"
+					: "已写入笔记 · 转写中…",
+			);
 		} catch (e) {
 			chip.done(
 				`笔记创建失败（音频已在附件）：${e instanceof Error ? e.message : String(e)}`,
@@ -684,12 +776,12 @@ export class NotebookView extends ItemView {
 						: "转写";
 			const raw = pipe.transcript.trim();
 			const polished = (pipe.polished || "").trim();
-			const parts = ["## 转写", "", raw];
-			if (polished && polished !== raw) {
-				parts.push("", "## 润色", "", polished);
-			}
-			parts.push(pipe.embedMarkdown || embedMarkdown);
-			const body = parts.join("\n");
+			const body = buildVoiceBlock({
+				vaultPath,
+				embedMarkdown: pipe.embedMarkdown || embedMarkdown,
+				transcript: raw,
+				polished,
+			});
 			const titleSrc = polished || raw;
 			const titleLine =
 				titleSrc
@@ -698,9 +790,22 @@ export class NotebookView extends ItemView {
 					?.slice(0, 40) || title;
 			try {
 				if (pendingItem) {
-					const updated = await this.plugin.items.updateItem(pendingItem, {
-						title: titleLine,
-						body,
+					const fresh = await this.plugin.items.findById(
+						this.meta,
+						pendingItem.frontmatter.item_id,
+					);
+					if (!fresh) throw new Error("目标条目已不存在");
+					const nextBody = appendMode
+						? applyRetranscribeToBody(fresh.body || "", {
+							vaultPath,
+							transcript: raw,
+							polished,
+							warning: "",
+						})
+						: body;
+					const updated = await this.plugin.items.updateItem(fresh, {
+						...(appendMode ? {} : { title: titleLine }),
+						body: nextBody,
 						fields: {
 							source: "voice",
 							transcribe_status: "done",
@@ -732,32 +837,37 @@ export class NotebookView extends ItemView {
 			return;
 		}
 
-		const draft = [
-			"## 转写",
-			"",
-			pipe.error
-				? `> 自动转写未成功：${pipe.error}`
-				: "> 自动转写未成功。",
-			pipe.errorDetail
-				? `\n> 详情：${pipe.errorDetail.replace(/\n/g, " · ").slice(0, 280)}\n`
-				: "",
-			"",
-			"下方可直接播放录音；也可手动把听到的内容写在本段下方。",
-			pipe.embedMarkdown || embedMarkdown,
-		]
-			.filter((line) => line !== "")
-			.join("\n");
+		const failureWarning = [pipe.error, pipe.errorDetail]
+			.filter(Boolean)
+			.join(" · ") || "自动转写未成功";
+		const draft = buildVoiceBlock({
+			vaultPath,
+			embedMarkdown: pipe.embedMarkdown || embedMarkdown,
+			warning: failureWarning,
+		});
 		try {
-			if (pendingItem) {
-				const updated = await this.plugin.items.updateItem(pendingItem, {
-					body: draft,
+				if (pendingItem) {
+					const fresh = await this.plugin.items.findById(
+						this.meta,
+						pendingItem.frontmatter.item_id,
+					);
+					if (!fresh) throw new Error("目标条目已不存在");
+					const nextBody = appendMode
+						? applyRetranscribeToBody(fresh.body || "", {
+						vaultPath,
+						transcript: "",
+						polished: "",
+						warning: failureWarning,
+					})
+					: draft;
+				this.activeItem = await this.plugin.items.updateItem(fresh, {
+					body: nextBody,
 					fields: {
 						source: "voice",
 						transcribe_status: "failed",
 						audio_path: vaultPath,
 					},
 				});
-				this.activeItem = updated;
 				await this.reload();
 			} else {
 				await this.createFromTranscript(draft, {
@@ -774,6 +884,27 @@ export class NotebookView extends ItemView {
 		chip.done(`失败 · ${detail || "见笔记"}`, false);
 	}
 
+	private async appendTranscriptToItem(
+		itemId: string,
+		text: string,
+		opts?: { sourceLabel?: string },
+	): Promise<void> {
+		if (!this.meta) return;
+		const item = await this.plugin.items.findById(this.meta, itemId);
+		if (!item) {
+			new Notice("目标条目不存在");
+			return;
+		}
+		const updated = await this.plugin.items.appendToItem(item, {
+			body: text,
+			heading: opts?.sourceLabel || "文字补充",
+			fields: { source: opts?.sourceLabel || "text" },
+		});
+		this.activeItem = updated;
+		await this.reload();
+		new Notice(`已追加到：${updated.frontmatter.title}`);
+	}
+
 	/** Draggable voice progress chip; position saved in settings. */
 	private showVoiceProgressChip(initial: string): {
 		set: (msg: string) => void;
@@ -788,7 +919,7 @@ export class NotebookView extends ItemView {
 			cls: "ai-notebook-voice-chip-text",
 			text: initial,
 		});
-		
+
 		const saved = this.plugin.settings.voice?.chipPosition;
 		const place = () => {
 			const w = el.offsetWidth || 200;
@@ -808,14 +939,14 @@ export class NotebookView extends ItemView {
 			}
 		};
 		place();
-		
+
 		let dragging = false;
 		let moved = false;
 		let startX = 0;
 		let startY = 0;
 		let origL = 0;
 		let origT = 0;
-		
+
 		const onDown = (clientX: number, clientY: number) => {
 			dragging = true;
 			moved = false;
@@ -858,7 +989,7 @@ export class NotebookView extends ItemView {
 			};
 			void this.plugin.saveSettings();
 		};
-		
+
 		el.addEventListener("pointerdown", (ev) => {
 			if (ev.button != null && ev.button !== 0) return;
 			ev.preventDefault();
@@ -870,7 +1001,7 @@ export class NotebookView extends ItemView {
 		});
 		el.addEventListener("pointerup", () => onUp());
 		el.addEventListener("pointercancel", () => onUp());
-		
+
 		return {
 			set: (msg: string) => {
 				text.setText(msg);
@@ -1030,9 +1161,7 @@ export class NotebookView extends ItemView {
 		listPane: HTMLElement,
 		detailPane: HTMLElement,
 	): Promise<void> {
-		const tabBar = listPane.querySelector(".ai-notebook-tab-bar");
-		listPane.empty();
-		if (tabBar) listPane.appendChild(tabBar);
+		this.preserveTabBar(listPane, detailPane, "inbox");
 
 		const actions = listPane.createDiv({ cls: "ai-notebook-settings-actions" });
 		const dumpBtn = actions.createEl("button", { text: "写入一条速记" });
@@ -1137,7 +1266,7 @@ export class NotebookView extends ItemView {
 			opt0.selected = true;
 			for (const it of items) {
 				itemSelect.createEl("option", {
-					text: it.frontmatter.title || it.frontmatter.item_id,
+					text: itemBasename(it.path) || it.frontmatter.title || it.frontmatter.item_id,
 					value: it.frontmatter.item_id,
 				});
 			}
@@ -1941,6 +2070,22 @@ export class NotebookView extends ItemView {
 						const a = block.createEl("audio");
 						a.src = this.vaultResourceUrl(emb.path);
 						a.controls = true;
+						const row = block.createDiv({
+							cls: "ai-notebook-voice-actions",
+						});
+						row.createDiv({
+							cls: "ai-notebook-voice-path",
+							text: `录音文件：${emb.path}`,
+						});
+						const btn = row.createEl("button", {
+							text: "再转写",
+							cls: "ai-notebook-retranscribe-btn",
+						});
+						btn.addEventListener("click", (ev) => {
+							ev.preventDefault();
+							ev.stopPropagation();
+							void this.retranscribeExistingAudio(emb.path);
+						});
 					}
 				}
 			};
@@ -1986,41 +2131,11 @@ export class NotebookView extends ItemView {
 		body?: string;
 	}): Promise<void> {
 		if (!this.activeItem || !this.meta) return;
-		const prevTitle = this.activeItem.frontmatter.title;
-		const itemId = this.activeItem.frontmatter.item_id;
 		try {
 			this.activeItem = await this.plugin.items.updateItem(
 				this.activeItem,
 				patch,
 			);
-			// Title rename → rename attachment folders + rewrite embeds
-			if (
-				patch.title != null &&
-				patch.title.trim() &&
-				patch.title.trim() !== prevTitle
-			) {
-				try {
-					const rewrites = await this.plugin.attachments.syncItemTitle(
-						this.meta,
-						itemId,
-						patch.title.trim(),
-					);
-					if (rewrites.length) {
-						const nextBody = this.plugin.attachments.rewriteEmbedPaths(
-							this.activeItem.body,
-							rewrites,
-						);
-						if (nextBody !== this.activeItem.body) {
-							this.activeItem = await this.plugin.items.updateItem(
-								this.activeItem,
-								{ body: nextBody },
-							);
-						}
-					}
-				} catch {
-					// keep title even if folder rename fails
-				}
-			}
 			// Body edit may introduce new paste embeds → absorb
 			if (patch.body != null) {
 				try {
@@ -2160,10 +2275,21 @@ export class NotebookView extends ItemView {
 			if (this.activeItem?.frontmatter.item_id === item.frontmatter.item_id) {
 				row.addClass("is-active");
 			}
+			const fileTitle = itemBasename(item.path);
 			row.createDiv({
 				cls: "ai-notebook-item-title",
-				text: item.frontmatter.title || "未命名",
+				text: fileTitle || item.frontmatter.title || "未命名",
 			});
+			if (
+				item.frontmatter.title &&
+				fileTitle &&
+				item.frontmatter.title !== fileTitle
+			) {
+				row.createDiv({
+					cls: "ai-notebook-item-meta",
+					text: `标题：${item.frontmatter.title}`,
+				});
+			}
 			const cols = this.plugin.runtime.listColumns(item.frontmatter.entity_type);
 			const extras = cols
 				.filter((f) => f.id !== "title")
@@ -2203,7 +2329,7 @@ export class NotebookView extends ItemView {
 				tr.addClass("is-active");
 			}
 			tr.createEl("td", { text: formatItemTime(item) });
-			tr.createEl("td", { text: item.frontmatter.title || "未命名" });
+			tr.createEl("td", { text: itemDisplayName(item) });
 			for (const f of cols) {
 				if (f.id === "title") continue;
 				tr.createEl("td", { text: formatCell(item.frontmatter[f.id]) });
@@ -2241,10 +2367,21 @@ export class NotebookView extends ItemView {
 				if (this.activeItem?.frontmatter.item_id === item.frontmatter.item_id) {
 					card.addClass("is-active");
 				}
+				const fileTitle = itemBasename(item.path);
 				card.createDiv({
 					cls: "ai-notebook-item-title",
-					text: item.frontmatter.title || "未命名",
+					text: fileTitle || item.frontmatter.title || "未命名",
 				});
+				if (
+					item.frontmatter.title &&
+					fileTitle &&
+					item.frontmatter.title !== fileTitle
+				) {
+					card.createDiv({
+						cls: "ai-notebook-item-meta",
+						text: `标题：${item.frontmatter.title}`,
+					});
+				}
 				card.createDiv({
 					cls: "ai-notebook-item-meta",
 					text: formatItemTime(item),
@@ -2257,12 +2394,57 @@ export class NotebookView extends ItemView {
 	}
 
 
+
+	/** Keep top tabs when switching 条目/附件/收藏柜/收件箱. */
+	private preserveTabBar(
+		listPane: HTMLElement,
+		detailPane: HTMLElement,
+		active: "items" | "attachments" | "cabinet" | "inbox",
+	): void {
+		const oldBar = listPane.querySelector(".ai-notebook-tab-bar");
+		listPane.empty();
+		detailPane.empty();
+		const tabBar =
+			(oldBar as HTMLElement) ||
+			listPane.createDiv({ cls: "ai-notebook-tab-bar" });
+		if (!oldBar) {
+			// will rebuild below
+		} else {
+			listPane.appendChild(tabBar);
+		}
+		tabBar.empty();
+		const itemsTab = tabBar.createEl("button", { text: "条目" });
+		const attTab = tabBar.createEl("button", { text: "附件" });
+		const cabTab = tabBar.createEl("button", { text: "收藏柜" });
+		const inboxTab = tabBar.createEl("button", { text: "收件箱" });
+		itemsTab.toggleClass("mod-cta", active === "items");
+		attTab.toggleClass("mod-cta", active === "attachments");
+		cabTab.toggleClass("mod-cta", active === "cabinet");
+		inboxTab.toggleClass("mod-cta", active === "inbox");
+		itemsTab.addEventListener("click", () => {
+			this.leftTab = "items";
+			this.render();
+		});
+		attTab.addEventListener("click", () => {
+			this.leftTab = "attachments";
+			void this.renderAttachments(listPane, detailPane);
+		});
+		cabTab.addEventListener("click", () => {
+			this.leftTab = "cabinet";
+			void this.renderCabinet(listPane, detailPane);
+		});
+		inboxTab.addEventListener("click", () => {
+			this.leftTab = "inbox";
+			void this.renderInbox(listPane, detailPane);
+		});
+		if (!oldBar) listPane.insertBefore(tabBar, listPane.firstChild);
+	}
+
 	private async renderAttachments(
 		listPane: HTMLElement,
 		detailPane: HTMLElement,
 	): Promise<void> {
-		listPane.empty();
-		detailPane.empty();
+		this.preserveTabBar(listPane, detailPane, "attachments");
 		if (!this.meta) return;
 		const meta = this.meta;
 
@@ -2348,7 +2530,7 @@ export class NotebookView extends ItemView {
 					data,
 					mime: f.type || undefined,
 					item_id: targetItem.frontmatter.item_id,
-					itemName: targetItem.frontmatter.title,
+					itemName: itemDisplayName(targetItem),
 					kind: "backup",
 					origin: "desktop-import",
 				});
@@ -2493,25 +2675,7 @@ export class NotebookView extends ItemView {
 		listPane: HTMLElement,
 		detailPane: HTMLElement,
 	): Promise<void> {
-		// keep tab bar; clear rest of list pane children except first tab bar
-		const tabBar = listPane.querySelector(".ai-notebook-tab-bar");
-		listPane.empty();
-		if (tabBar) listPane.appendChild(tabBar);
-		else {
-			const bar = listPane.createDiv({ cls: "ai-notebook-tab-bar" });
-			const itemsTab = bar.createEl("button", { text: "条目" });
-			const cabTab = bar.createEl("button", { text: "收藏柜" });
-			const inboxTab = bar.createEl("button", { text: "收件箱" });
-			cabTab.addClass("mod-cta");
-			itemsTab.addEventListener("click", () => {
-				this.leftTab = "items";
-				this.render();
-			});
-			inboxTab.addEventListener("click", () => {
-				this.leftTab = "inbox";
-				void this.renderInbox(listPane, detailPane);
-			});
-		}
+		this.preserveTabBar(listPane, detailPane, "cabinet");
 
 		if (!this.meta) return;
 		const meta = this.meta;
@@ -2633,7 +2797,7 @@ export class NotebookView extends ItemView {
 								vaultPath: file.path,
 								size: file.stat.size,
 								item_id: this.activeItem?.frontmatter.item_id ?? null,
-							itemName: this.activeItem?.frontmatter.title ?? null,
+							itemName: this.activeItem ? itemDisplayName(this.activeItem) : null,
 							},
 						);
 						new Notice(`已登记：${registered.displayName}`);
@@ -2681,7 +2845,7 @@ export class NotebookView extends ItemView {
 					data,
 					mime: f.type || undefined,
 					item_id: this.activeItem?.frontmatter.item_id ?? null,
-					itemName: this.activeItem?.frontmatter.title ?? null,
+					itemName: this.activeItem ? itemDisplayName(this.activeItem) : null,
 					kind: "backup",
 					origin: "desktop-import",
 				});
@@ -2846,6 +3010,44 @@ export class NotebookView extends ItemView {
 		}
 	}
 
+	/**
+	 * Re-run STT on an audio file already in the vault (desktop only).
+	 * Updates only the transcript near this embed; never deletes the audio.
+	 */
+		private async retranscribeExistingAudio(vaultPath: string): Promise<void> {
+		if (!this.meta || !this.activeItem) {
+			new Notice("请先选中条目");
+			return;
+		}
+		const chip = this.showVoiceProgressChip("再转写 · 读取音频…");
+		await retranscribeVaultAudio(
+			{
+				app: this.app,
+				voicePipeline: this.plugin.voicePipeline,
+				items: this.plugin.items,
+				notebooks: this.plugin.notebooks,
+				onProgress: (msg) => chip.set(msg),
+				onDone: (ok, msg) => chip.done(msg, ok),
+			},
+			{
+				vaultPath,
+				meta: this.meta,
+				item: this.activeItem,
+			},
+		);
+		// refresh item from disk
+		try {
+			const fresh = await this.plugin.items.findById(
+				this.meta,
+				this.activeItem.frontmatter.item_id,
+			);
+			if (fresh) this.activeItem = fresh;
+			await this.reload();
+		} catch {
+			/* ignore */
+		}
+	}
+
 	private vaultResourceUrl(vaultPath: string): string {
 		const p = vaultPath.replace(/\\/g, "/");
 		try {
@@ -2868,9 +3070,9 @@ function cabinetFileOwnerLabel(file: CabinetFile, items: NotebookItem[]): string
 	const byId = file.item_id
 		? items.find((item) => item.frontmatter.item_id === file.item_id)
 		: undefined;
-	if (byId) return `条目：${byId.frontmatter.title}`;
+	if (byId) return `条目：${itemDisplayName(byId)}`;
 	const byRef = items.find((item) => item.frontmatter.cabinet_refs.includes(file.id));
-	if (byRef) return `条目：${byRef.frontmatter.title}`;
+	if (byRef) return `条目：${itemDisplayName(byRef)}`;
 	if (file.item_id) return `条目已不存在：${file.item_id.slice(0, 8)}`;
 	return "未关联条目";
 }
@@ -3001,7 +3203,7 @@ function mediaKindFromPath(
 function attachmentOwnerLabel(file: AttachmentRecord, items: NotebookItem[]): string {
 	if (file.item_id) {
 		const byId = items.find((item) => item.frontmatter.item_id === file.item_id);
-		if (byId) return byId.frontmatter.title || file.item_id;
+		if (byId) return itemDisplayName(byId);
 		return file.item_id;
 	}
 	return "未关联条目";
@@ -3020,4 +3222,110 @@ function attachmentKindLabel(kind: AttachmentKind): string {
 		default:
 			return "其他";
 	}
+}
+
+
+/** Desktop re-STT: write/replace transcript next to a specific audio vault path. */
+function applyDesktopRetranscribeToBody(
+	oldBody: string,
+	opts: {
+		vaultPath: string;
+		transcript: string;
+		polished: string;
+		warning: string;
+	},
+): string {
+	const old = oldBody || "";
+	const path = opts.vaultPath.replace(/\\/g, "/");
+	const stt = buildDesktopSttBlock(opts);
+	const markers = [`![[${path}]]`, path];
+	let anchorIdx = -1;
+	let anchorMark = "";
+	for (const mk of markers) {
+		const i = old.indexOf(mk);
+		if (i >= 0) {
+			anchorIdx = i;
+			anchorMark = mk;
+			break;
+		}
+	}
+	if (anchorIdx < 0) {
+		const embed = `\n\n## 录音\n\n![[${path}]]\n\n> 录音文件：\`${path}\`\n\n${stt}\n`;
+		return `${old.trimEnd()}${embed}`;
+	}
+	let end = anchorIdx + anchorMark.length;
+	const afterMark = old.slice(end);
+	const lineEnd = afterMark.indexOf("\n");
+	if (lineEnd >= 0) end += lineEnd + 1;
+	else end = old.length;
+	let guard = 0;
+	while (guard++ < 5 && end < old.length) {
+		const rest = old.slice(end);
+		const nl = rest.indexOf("\n");
+		const line = (nl < 0 ? rest : rest.slice(0, nl)).trim();
+		if (!line) {
+			end += nl < 0 ? rest.length : nl + 1;
+			break;
+		}
+		if (line.startsWith("#") || line.startsWith("<!-- ai-notebook")) break;
+		if (
+			line.startsWith(">") &&
+			!/录音文件|转写失败|转写处理中|⚠️|自动转写/.test(line)
+		) {
+			end += nl < 0 ? rest.length : nl + 1;
+			if (nl < 0) break;
+			continue;
+		}
+		if (line.startsWith(">") && /转写失败|转写处理中|⚠️|自动转写/.test(line)) {
+			break;
+		}
+		if (line.startsWith("![[") || line.startsWith("[[") || line.includes(path)) {
+			end += nl < 0 ? rest.length : nl + 1;
+			if (nl < 0) break;
+			continue;
+		}
+		break;
+	}
+	const before = old.slice(0, end);
+	let after = old.slice(end);
+	after = after.replace(
+		/^(\s*\n)*(>[^\n]*(转写处理中|转写失败|自动转写|⚠️)[^\n]*)/,
+		"",
+	);
+	const sttSection = after.match(
+		/^(\s*\n)*((?:#{2,3}\s*(?:语音)?转写[\s\S]*?)(?=(?:\n#{2,3}\s|\n!\[\[|\n<!-- ai-notebook|$)))/,
+	);
+	if (sttSection) {
+		after = after.slice(sttSection[0].length);
+	}
+	const polishSection = after.match(
+		/^(\s*\n)*(#{2,3}\s*润色[\s\S]*?)(?=(?:\n#{2,3}\s|\n!\[\[|\n<!-- ai-notebook|$))/,
+	);
+	if (polishSection) {
+		after = after.slice(polishSection[0].length);
+	}
+	const out = `${before.trimEnd()}\n\n${stt}\n${after.replace(/^\s*\n/, "\n")}`;
+	return out.replace(/\n{4,}/g, "\n\n\n").trimEnd() + "\n";
+}
+
+function buildDesktopSttBlock(opts: {
+	transcript: string;
+	polished: string;
+	warning: string;
+}): string {
+	const raw = (opts.transcript || "").trim();
+	if (raw) {
+		const polished = (opts.polished || "").trim();
+		const parts = ["### 语音转写", "", raw];
+		if (polished && polished !== raw) {
+			parts.push("", "### 润色", "", polished);
+		}
+		return parts.join("\n");
+	}
+	const warn = String(opts.warning || "自动转写未成功")
+		.replace(/<[^>]+>/g, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.slice(0, 160);
+	return `> ⚠️ 转写失败：${warn}（录音已保留，可点「再转写」重试）`;
 }

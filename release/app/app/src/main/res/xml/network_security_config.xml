@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Tailscale (100.64/10), LAN, and local bridge are typically HTTP -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

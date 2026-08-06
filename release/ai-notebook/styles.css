@@ -1104,3 +1104,41 @@
 	0%, 100% { opacity: 0.45; transform: scale(0.9); }
 	50% { opacity: 1; transform: scale(1.1); }
 }
+
+
+.ai-notebook-voice-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.ai-notebook-voice-path {
+  font-size: 12px;
+  opacity: 0.75;
+  word-break: break-all;
+}
+.ai-notebook-retranscribe-btn {
+  font-size: 12px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+
+/* Reading view retranscribe */
+.markdown-reading-view .ai-notebook-voice-actions,
+.markdown-preview-view .ai-notebook-voice-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  margin-bottom: 8px;
+}
+.markdown-reading-view .ai-notebook-retranscribe-btn,
+.markdown-preview-view .ai-notebook-retranscribe-btn {
+  font-size: 12px;
+  padding: 2px 10px;
+  cursor: pointer;
+  border-radius: 4px;
+}

@@ -1,3 +1,4 @@
+import { itemDisplayName } from "./itemDisplayName";
 import type { AiNotebookSettings, NotebookMeta } from "../domain/types";
 import { createId, nowIso } from "../domain/ids";
 import {
@@ -308,6 +309,30 @@ export class AttachmentService {
 			if (n > 200) break;
 		}
 		return candidate;
+	}
+
+	async syncItemFolder(
+		meta: NotebookMeta,
+		item: NotebookItem,
+	): Promise<Array<{ from: string; to: string }>> {
+		return this.syncItemTitle(
+			meta,
+			item.frontmatter.item_id,
+			itemDisplayName(item),
+		);
+	}
+
+	/** Move managed files into the stable filename-based item folder. */
+	async migrateItemFolders(
+		meta: NotebookMeta,
+		items: NotebookItem[],
+	): Promise<Map<string, Array<{ from: string; to: string }>>> {
+		const migrated = new Map<string, Array<{ from: string; to: string }>>();
+		for (const item of items) {
+			const rewrites = await this.syncItemFolder(meta, item);
+			if (rewrites.length) migrated.set(item.frontmatter.item_id, rewrites);
+		}
+		return migrated;
 	}
 
 	/**

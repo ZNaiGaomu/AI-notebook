@@ -1,7 +1,7 @@
 {
 	"id": "ai-notebook",
 	"name": "AI 记录本",
-	"version": "0.6.0",
+	"version": "0.7.0",
 	"minAppVersion": "1.5.0",
 	"description": "多实例 AI 记录本：可版本化功能蓝图、手工条目自动吸收、浮层助手、语音流水线、手机端记录本/条目定向追加与新建、插件历史切换。",
 	"author": "zn217",

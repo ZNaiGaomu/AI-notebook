@@ -1,3 +1,4 @@
+import { itemDisplayName } from "../services/itemDisplayName";
 import { App, FuzzySuggestModal, Notice } from "obsidian";
 import type { NotebookItem, NotebookMeta } from "../domain/types";
 import type AiNotebookPlugin from "../main";
@@ -55,7 +56,7 @@ export class ChatPickItemModal extends FuzzySuggestModal<NotebookItem> {
 	}
 
 	getItemText(item: NotebookItem): string {
-		const title = item.frontmatter.title || "未命名";
+		const title = itemDisplayName(item);
 		const id = item.frontmatter.item_id.slice(0, 8);
 		return `${title}  (${id}…)`;
 	}

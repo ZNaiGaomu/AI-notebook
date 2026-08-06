@@ -1,3 +1,4 @@
+import { itemDisplayName } from "../services/itemDisplayName";
 import type { Blueprint, NotebookItem } from "../domain/types";
 
 export type ListFilterState = Record<string, string>;
@@ -19,7 +20,7 @@ export function sortItemsByBlueprint(
 	copy.sort((a, b) => {
 		switch (sort) {
 			case "title_asc":
-				return a.frontmatter.title.localeCompare(b.frontmatter.title, "zh");
+				return itemDisplayName(a).localeCompare(itemDisplayName(b), "zh");
 			case "created_desc":
 				return (b.frontmatter.created || "").localeCompare(
 					a.frontmatter.created || "",

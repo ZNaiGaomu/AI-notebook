@@ -1,3 +1,4 @@
+import { itemDisplayName } from "./itemDisplayName";
 import type { AiNotebookSettings, NotebookMeta } from "../domain/types";
 import { createId, nowIso, shortId, todayDatePrefix } from "../domain/ids";
 import {
@@ -275,6 +276,14 @@ async resolveTargetNotebook(): Promise<NotebookMeta | null> {
 			typeof frontmatter.inbox_file === "string"
 				? frontmatter.inbox_file.trim()
 				: "";
+		const inboxFilesRoot = inboxFilesDir(this.getSettings()).replace(/\\/g, "/").replace(/\/+$/, "");
+		const normalizedInboxFile = inboxFile.replace(/\\/g, "/").replace(/^\/+/, "");
+		const safeInboxFile =
+			Boolean(normalizedInboxFile) &&
+			!normalizedInboxFile.split("/").includes("..") &&
+			!normalizedInboxFile.startsWith("/") &&
+			!normalizedInboxFile.toLowerCase().endsWith(".md") &&
+			(normalizedInboxFile === inboxFilesRoot || normalizedInboxFile.startsWith(`${inboxFilesRoot}/`));
 		const targetItemId = opts?.targetItemId?.trim() || null;
 		let item: NotebookItem | null = null;
 		let organized = false;
@@ -326,12 +335,12 @@ async resolveTargetNotebook(): Promise<NotebookMeta | null> {
 		}
 
 		// Move inbox binary into attachment management for the item
-		if (item && this.attachments && inboxFile) {
+		if (item && this.attachments && safeInboxFile) {
 			try {
 				const absorbed = await this.attachments.absorbVaultFile(meta, {
-					vaultPath: inboxFile,
+					vaultPath: normalizedInboxFile,
 					item_id: item.frontmatter.item_id,
-					itemName: item.frontmatter.title,
+					itemName: itemDisplayName(item),
 					kind: "backup",
 					origin: "inbox-file",
 					mime: String(frontmatter.mime ?? ""),

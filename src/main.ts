@@ -1,4 +1,11 @@
-import { Notice, Platform, Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import {
+	MarkdownRenderChild,
+	Notice,
+	Platform,
+	Plugin,
+	TFile,
+	WorkspaceLeaf,
+} from "obsidian";
 import type { AiNotebookSettings, NotebookMeta } from "./domain/types";
 import {
 	createDefaultSettings,
@@ -18,6 +25,10 @@ import { CabinetService } from "./services/cabinetService";
 import { AttachmentService } from "./services/attachmentService";
 import { VoiceService } from "./services/voiceService";
 import { VoicePipeline } from "./services/voicePipeline";
+import {
+	retranscribeVaultAudio,
+	extractAudioVaultPath,
+} from "./services/voiceRetranscribe";
 import { VoiceDiagnostics } from "./services/voiceDiagnostics";
 import { OrganizeService } from "./services/organizeService";
 import { InboxService } from "./services/inboxService";
@@ -184,10 +195,17 @@ export default class AiNotebookPlugin extends Plugin {
 				await this.saveSettings();
 			},
 			resolveVoice: (notebook) =>
-				this.resolveAi("voice", notebook) ||
-				this.resolveAi("worker", notebook) ||
-				this.resolveAi("planner", notebook),
-			inbox: this.inbox,
+					resolveProvider(this.settings, "voice", notebook, { stt: true }),
+				resolveVoiceChain: (notebook) =>
+					resolveProviderChain(this.settings, "voice", notebook, {
+						stt: true,
+					}).map((r) => ({
+						profile: r.profile,
+						model: r.model,
+						slotIndex: r.slotIndex,
+					})),
+				voicePipeline: this.voicePipeline,
+				inbox: this.inbox,
 			organize: this.organize,
 			voice: this.voice,
 			items: this.items,
@@ -207,6 +225,7 @@ export default class AiNotebookPlugin extends Plugin {
 		this.publicTunnel = new PublicTunnel();
 
 		this.registerAttachmentPasteWatcher();
+			this.registerVoiceRetranscribeInReadingView();
 
 		this.registerView(
 			VIEW_TYPE_AI_NOTEBOOK,
@@ -334,7 +353,7 @@ export default class AiNotebookPlugin extends Plugin {
 			},
 		});
 
-		
+
 		// Keep notebook display name in sync when user renames folder in file explorer
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
@@ -395,6 +414,135 @@ this.addSettingTab(new AiNotebookSettingTab(this.app, this));
 		notebook?: NotebookMeta | null,
 	) {
 		return resolveProvider(this.settings, purpose, notebook);
+	}
+
+
+	/**
+	 * Reading view enhancer. Scoped to each Markdown render root and idempotent by
+	 * normalized audio path. No document-wide polling.
+	 */
+	private registerVoiceRetranscribeInReadingView(): void {
+		// Remove leftovers from the old polling implementation on plugin reload.
+		document
+			.querySelectorAll(".ai-notebook-voice-actions")
+			.forEach((node) => node.remove());
+
+		this.registerMarkdownPostProcessor((el, ctx) => {
+			const child = new MarkdownRenderChild(el);
+			ctx.addChild(child);
+			let frame = 0;
+			let stopped = false;
+
+			const schedule = () => {
+				if (stopped || frame) return;
+				frame = window.requestAnimationFrame(() => {
+					frame = 0;
+					this.decorateVoiceRetranscribeRoot(el);
+				});
+			};
+
+			const observer = new MutationObserver(() => schedule());
+			observer.observe(el, { childList: true, subtree: true });
+			child.register(() => {
+				stopped = true;
+				observer.disconnect();
+				if (frame) window.cancelAnimationFrame(frame);
+			});
+			schedule();
+		});
+	}
+
+	private decorateVoiceRetranscribeRoot(root: HTMLElement): void {
+		// Delete leftovers created by the previous polling version in this root.
+		root
+			.querySelectorAll(
+				".ai-notebook-voice-actions:not(.ai-notebook-retranscribe-control)",
+			)
+			.forEach((node) => node.remove());
+
+		const seen = new Set<string>();
+		for (const audio of Array.from(root.querySelectorAll("audio"))) {
+			const path = extractAudioVaultPath(audio as HTMLElement);
+			if (!path || seen.has(path)) continue;
+			seen.add(path);
+
+			const escapedPath = this.escapeCssAttribute(path);
+			const existing = Array.from(
+				root.querySelectorAll<HTMLElement>(
+					`.ai-notebook-retranscribe-control[data-audio-path="${escapedPath}"]`,
+				),
+			);
+			if (existing.length > 0) {
+				// Self-heal duplicates, preserving the first control.
+				existing.slice(1).forEach((node) => node.remove());
+				continue;
+			}
+
+			const control = document.createElement("div");
+			control.className =
+				"ai-notebook-voice-actions ai-notebook-retranscribe-control";
+			control.dataset.audioPath = path;
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "ai-notebook-retranscribe-btn";
+			button.textContent = "再转写";
+			const status = document.createElement("span");
+			status.className = "ai-notebook-retranscribe-status";
+			button.addEventListener("click", (event) => {
+				event.preventDefault();
+				event.stopPropagation();
+				if (button.disabled) return;
+				button.disabled = true;
+				control.classList.add("is-busy");
+				button.textContent = "转写中…";
+				status.textContent = "正在读取录音";
+				void retranscribeVaultAudio(
+					{
+						app: this.app,
+						voicePipeline: this.voicePipeline,
+						items: this.items,
+						notebooks: this.notebooks,
+						onProgress: (message) => {
+							status.textContent = message.replace(/^再转写\s*·\s*/, "");
+						},
+						onDone: (ok, message) => {
+							status.textContent = message;
+							control.classList.toggle("is-success", ok);
+							control.classList.toggle("is-error", !ok);
+						},
+					},
+					{ vaultPath: path },
+				).finally(() => {
+					button.disabled = false;
+					control.classList.remove("is-busy");
+					button.textContent = "再转写";
+				});
+			});
+			control.append(button, status);
+
+			const anchor =
+				(audio.closest(
+					".internal-embed, .media-embed, span.internal-embed",
+				) as HTMLElement | null) || audio;
+			anchor.insertAdjacentElement("afterend", control);
+		}
+
+		// Remove controls whose corresponding audio no longer exists in this root.
+		for (const control of Array.from(
+			root.querySelectorAll<HTMLElement>(
+				".ai-notebook-retranscribe-control[data-audio-path]",
+			),
+		)) {
+			const path = control.dataset.audioPath || "";
+			if (!seen.has(path)) control.remove();
+		}
+	}
+
+	private escapeCssAttribute(value: string): string {
+		if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+			return CSS.escape(value);
+		}
+		return value.replace(/["\\]/g, "\\$&");
 	}
 
 	onunload(): void {

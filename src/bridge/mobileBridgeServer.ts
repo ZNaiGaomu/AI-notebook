@@ -9,6 +9,12 @@ import type {
 	TemplateId,
 } from "../domain/types";
 import { createId, shortId } from "../domain/ids";
+import { itemDisplayName } from "../services/itemDisplayName";
+import {
+	applyRetranscribeToBody,
+	buildVoiceBlock,
+	itemBasename,
+} from "../services/voiceRetranscribe";
 import type { InboxService } from "../services/inboxService";
 import type { OrganizeService } from "../services/organizeService";
 import type { VoiceService } from "../services/voiceService";
@@ -18,6 +24,7 @@ import type { AttachmentService } from "../services/attachmentService";
 import {
 	buildAttachmentEmbedMarkdown,
 } from "../services/attachmentService";
+import type { VoicePipeline } from "../services/voicePipeline";
 import { buildMobilePageHtml } from "./mobilePageHtml";
 
 export type BridgeDeps = {
@@ -39,6 +46,12 @@ export type BridgeDeps = {
 	resolveVoice: (
 		notebook?: NotebookMeta | null,
 	) => { profile: ProviderProfile; model: string } | null;
+	/** Full voice purpose chain for STT polling (never stop at first failure). */
+	resolveVoiceChain?: (
+		notebook?: NotebookMeta | null,
+	) => Array<{ profile: ProviderProfile; model: string; slotIndex?: number }>;
+	/** Desktop-identical STT pipeline (full chain + chat-audio fallback). */
+	voicePipeline?: VoicePipeline;
 	inbox: InboxService;
 	organize: OrganizeService;
 	voice: VoiceService;
@@ -47,6 +60,20 @@ export type BridgeDeps = {
 	/** Ordinary uploads use attachments, not cabinet. */
 	attachments: AttachmentService;
 	onNoteWritten?: (info: { title: string; path: string }) => void;
+};
+
+type VoiceJobStatus = "pending" | "running" | "done" | "failed";
+type VoiceJob = {
+	id: string;
+	status: VoiceJobStatus;
+	progress: string;
+	transcript: string;
+	warning: string;
+	path: string;
+	itemId: string;
+	title: string;
+	createdAt: number;
+	updatedAt: number;
 };
 
 export type BridgeStatus = {
@@ -66,9 +93,21 @@ export type BridgeStatus = {
 type RecentItem = {
 	title: string;
 	preview: string;
+	/** Destination note/item path in vault */
 	path: string;
 	organized: boolean;
 	at: string;
+	notebookId?: string;
+	notebookName?: string;
+	itemId?: string;
+	itemTitle?: string;
+	kind?: "text" | "voice" | "file" | "other";
+	/** What was uploaded (filename or text preview) */
+	sourceLabel?: string;
+	/** Attachment vault path for voice/file */
+	sourcePath?: string;
+	attachmentId?: string;
+	clientSourceId?: string;
 };
 
 /**
@@ -82,6 +121,10 @@ export class MobileBridgeServer {
 	private recent: RecentItem[] = [];
 
 	private lastError: string | undefined;
+
+	/** In-memory async STT jobs for mobile (audio already on disk). */
+	private voiceJobs = new Map<string, VoiceJob>();
+	private voiceWriteTails = new Map<string, Promise<void>>();
 
 	constructor(private readonly deps: BridgeDeps) {}
 	isRunning(): boolean {
@@ -376,6 +419,16 @@ export class MobileBridgeServer {
 				await this.handleVoice(res, body);
 				return;
 			}
+			if (url.pathname === "/api/voice-job" && req.method === "GET") {
+				const id = (url.searchParams.get("id") || "").trim();
+				const job = id ? this.voiceJobs.get(id) : undefined;
+				if (!job) {
+					this.json(res, 404, { ok: false, error: "任务不存在或已过期" });
+					return;
+				}
+				this.json(res, 200, { ok: true, job });
+				return;
+			}
 			if (url.pathname === "/api/file" && req.method === "POST") {
 				const body = await readJson(req);
 				await this.handleFile(res, body);
@@ -436,13 +489,13 @@ export class MobileBridgeServer {
 			fields: { source: "mobile-web-item" },
 		});
 		this.pushRecent({
-			title: item.frontmatter.title,
+			title: itemDisplayName(item),
 			preview: item.body.slice(0, 80),
 			path: item.path,
 			organized: false,
 			at: recentAt(body),
 		});
-		this.deps.onNoteWritten?.({ title: item.frontmatter.title, path: item.path });
+		this.deps.onNoteWritten?.({ title: itemDisplayName(item), path: item.path });
 		this.json(res, 200, { ok: true, item: itemPayload(item) });
 	}
 
@@ -450,7 +503,7 @@ export class MobileBridgeServer {
 		notebookId: string | null | undefined,
 	): Promise<NotebookMeta | null> {
 		const id = String(notebookId ?? "").trim();
-		if (!id) return null;
+		if (!id) return this.deps.resolveNotebookById(null);
 		if (this.deps.findNotebookById) return this.deps.findNotebookById(id);
 		const found = await this.deps.resolveNotebookById(id);
 		return found?.notebook_id === id ? found : null;
@@ -501,9 +554,7 @@ export class MobileBridgeServer {
 			this.json(res, 200, { ok: true, path, organized: false });
 			return;
 		}
-		const meta = itemId
-			? await this.resolveStrictNotebook(notebookId)
-			: await this.deps.resolveNotebookById(notebookId);
+		const meta = await this.resolveStrictNotebook(notebookId);
 		if (!meta) {
 			// fall back to inbox
 			const path = await this.deps.inbox.dumpRaw({ text, source: "mobile" });
@@ -522,21 +573,28 @@ export class MobileBridgeServer {
 				return;
 			}
 			this.pushRecent({
-				title: updated.frontmatter.title,
+				title: itemDisplayName(updated),
 				preview: text.slice(0, 80),
 				path: updated.path,
 				organized: false,
 				at: recentAt(body),
-			});
+				notebookId: meta.notebook_id,
+				notebookName: meta.name,
+				itemId: updated.frontmatter.item_id,
+				itemTitle: itemDisplayName(updated),
+				kind: "text",
+			sourceLabel:
+				typeof text !== "undefined" ? String(text).slice(0, 80) : undefined,
+		});
 			this.deps.onNoteWritten?.({
-				title: updated.frontmatter.title,
+				title: itemDisplayName(updated),
 				path: updated.path,
 			});
 			this.json(res, 200, {
 				ok: true,
 				appended: true,
 				itemId: updated.frontmatter.item_id,
-				title: updated.frontmatter.title,
+				title: itemDisplayName(updated),
 				path: updated.path,
 				organized: false,
 			});
@@ -549,19 +607,26 @@ export class MobileBridgeServer {
 			capturedAt: pickCapturedAt(body),
 		});
 		this.pushRecent({
-			title: cap.item.frontmatter.title,
+			title: itemDisplayName(cap.item),
 			preview: cap.item.body.slice(0, 80),
 			path: cap.item.path,
 			organized: cap.organized,
 			at: recentAt(body),
+			notebookId: meta.notebook_id,
+			notebookName: meta.name,
+			itemId: cap.item.frontmatter.item_id,
+			itemTitle: itemDisplayName(cap.item),
+			kind: "text",
+			sourceLabel:
+				typeof text !== "undefined" ? String(text).slice(0, 80) : undefined,
 		});
 		this.deps.onNoteWritten?.({
-			title: cap.item.frontmatter.title,
+			title: itemDisplayName(cap.item),
 			path: cap.item.path,
 		});
 		this.json(res, 200, {
 			ok: true,
-			title: cap.item.frontmatter.title,
+			title: itemDisplayName(cap.item),
 			path: cap.item.path,
 			organized: cap.organized,
 			error: cap.error,
@@ -572,7 +637,8 @@ export class MobileBridgeServer {
 		res: ServerResponse,
 		body: Record<string, unknown>,
 	): Promise<void> {
-		const b64 = String(body.audioBase64 ?? "");
+		const clientSourceId = sanitizeClientSourceId(body.clientSourceId);
+		const b64 = String(body.audioBase64 ?? "").replace(/\s+/g, "");
 		if (!b64) {
 			this.json(res, 400, { ok: false, error: "缺少 audioBase64" });
 			return;
@@ -584,20 +650,25 @@ export class MobileBridgeServer {
 				: Boolean(body.organize);
 		const notebookId = pickNotebookId(body);
 		const itemId = pickItemId(body);
-		const meta = itemId
-			? await this.resolveStrictNotebook(notebookId)
-			: await this.deps.resolveNotebookById(notebookId);
-		const resolved = this.deps.resolveVoice(meta);
-		if (!resolved) {
-			this.json(res, 400, {
-				ok: false,
-				error: "电脑未配置语音/默认 AI Provider，无法转写",
-			});
+		const meta = await this.resolveStrictNotebook(notebookId);
+
+		let buf: Buffer;
+		try {
+			buf = Buffer.from(b64, "base64");
+		} catch {
+			this.json(res, 400, { ok: false, error: "audioBase64 不是合法 Base64" });
 			return;
 		}
-		const buf = Buffer.from(b64, "base64");
+		if (!buf.length) {
+			this.json(res, 400, { ok: false, error: "音频数据为空" });
+			return;
+		}
 		const type = mime || "audio/wav";
-		const blob = new Blob([buf], { type });
+		const ab = buf.buffer.slice(
+			buf.byteOffset,
+			buf.byteOffset + buf.byteLength,
+		) as ArrayBuffer;
+		const blob = new Blob([ab], { type });
 		const ext = type.includes("wav")
 			? "wav"
 			: type.includes("mp3") || type.includes("mpeg")
@@ -607,105 +678,465 @@ export class MobileBridgeServer {
 					: type.includes("webm")
 						? "webm"
 						: "wav";
-		const tr = await this.deps.voice.transcribe(
-			resolved.profile,
-			resolved.model || "whisper-1",
-			blob,
-			`phone.${ext}`,
-		);
-		if (!tr.ok) {
-			this.json(res, 500, { ok: false, error: `转写失败: ${tr.error}` });
-			return;
-		}
-		try {
-			await this.deps.inbox.saveVoiceRaw(tr.text);
-		} catch {
-			// ignore
-		}
-		if (!organize || !meta) {
-			const path = await this.deps.inbox.dumpRaw({
-				text: tr.text,
-				source: "voice",
-			});
-			this.pushRecent({
-				title: "语音转写",
-				preview: tr.text.slice(0, 80),
-				path,
-				organized: false,
-				at: recentAt(body),
-			});
-			this.json(res, 200, {
-				ok: true,
-				transcript: tr.text,
-				path,
-				organized: false,
-			});
-			return;
-		}
-		if (itemId) {
-			const updated = await this.appendToItem(
-				meta,
-				itemId,
-				tr.text,
-				"语音转写追加",
-			);
-			if (!updated) {
-				this.json(res, 404, { ok: false, error: "条目不存在" });
-				return;
+		const fileName = `phone-voice-${Date.now()}.${ext}`;
+
+		// ——— 1) HARD REQUIREMENT: always land audio first (never blocked by STT) ———
+		if (!organize) {
+			try {
+				const dumped = await this.deps.inbox.dumpBinary({
+					fileName,
+					data: ab,
+					mime: type,
+					source: "mobile",
+					title: `手机语音 ${new Date().toLocaleString()}`,
+					note: "手机 App 语音（仅收件箱）",
+				});
+				// STT best-effort after dump
+				const stt = await this.pollVoiceTranscription(blob, fileName, meta);
+				this.pushRecent({
+					title: "手机语音",
+					preview: stt.transcript?.slice(0, 80) || fileName,
+					path: dumped.notePath,
+					organized: false,
+					at: recentAt(body),
+					kind: "voice",
+					sourceLabel: fileName,
+					sourcePath: dumped.filePath,
+					clientSourceId,
+				});
+				this.json(res, 200, {
+					ok: true,
+					path: dumped.notePath,
+					filePath: dumped.filePath,
+					inboxOnly: true,
+					transcript: stt.transcript || "",
+					warning: stt.warning,
+					organized: false,
+					clientSourceId,
+				});
+			} catch (e) {
+				this.json(res, 500, {
+					ok: false,
+					error: `收件箱写入失败: ${e instanceof Error ? e.message : String(e)}`,
+				});
 			}
-			this.pushRecent({
-				title: updated.frontmatter.title,
-				preview: tr.text.slice(0, 80),
-				path: updated.path,
-				organized: false,
-				at: recentAt(body),
-			});
-			this.deps.onNoteWritten?.({
-				title: updated.frontmatter.title,
-				path: updated.path,
-			});
-			this.json(res, 200, {
-				ok: true,
-				appended: true,
-				transcript: tr.text,
-				itemId: updated.frontmatter.item_id,
-				title: updated.frontmatter.title,
-				path: updated.path,
-				organized: false,
+			return;
+		}
+
+		if (!meta) {
+			try {
+				const dumped = await this.deps.inbox.dumpBinary({
+					fileName,
+					data: ab,
+					mime: type,
+					source: "mobile",
+					title: `手机语音 ${new Date().toLocaleString()}`,
+					note: "无记录本：音频已进收件箱",
+				});
+				this.json(res, 200, {
+					ok: true,
+					path: dumped.notePath,
+					filePath: dumped.filePath,
+					organized: false,
+					warning: "无记录本：音频已进收件箱",
+				});
+			} catch (e) {
+				this.json(res, 500, {
+					ok: false,
+					error: `收件箱写入失败: ${e instanceof Error ? e.message : String(e)}`,
+				});
+			}
+			return;
+		}
+
+		// Resolve / create target item, then attach audio into body FIRST
+		let item =
+			itemId ? await this.deps.items.findById(meta, itemId) : null;
+		if (itemId && !item) {
+			this.json(res, 404, {
+				ok: false,
+				error: `条目不存在（item_id=${itemId}）。请重新选择条目后再发。`,
 			});
 			return;
 		}
-		const cap = await this.deps.organize.captureStructured(meta, tr.text, {
-			useAi: true,
-			source: "mobile-web-voice",
-			sourceHint: "手机网页语音",
-			capturedAt: pickCapturedAt(body),
+		let created = false;
+		if (!item) {
+			item = await this.deps.items.createItem(meta, {
+				title: `手机语音 ${new Date().toLocaleString()}`,
+				body: "",
+				capturedAt: pickCapturedAt(body),
+				fields: { source: "mobile-voice" },
+			});
+			created = true;
+		}
+
+		let stored;
+		try {
+			stored = await this.deps.attachments.importBinary(meta, {
+				displayName: fileName,
+				data: ab,
+				mime: type,
+				item_id: item.frontmatter.item_id,
+				itemName: itemDisplayName(item),
+				kind: "voice",
+				origin: "mobile-voice",
+			});
+		} catch (e) {
+			this.json(res, 500, {
+				ok: false,
+				error: `音频附件保存失败: ${e instanceof Error ? e.message : String(e)}`,
+			});
+			return;
+		}
+
+				const embed = buildAttachmentEmbedMarkdown(stored, {
+			caption: `手机语音 · ${fileName} · ${type}`,
 		});
+		// Step 1: audio first + a path-addressable pending block
+		item = await this.deps.items.appendToItem(item, {
+			body: buildVoiceBlock({
+				vaultPath: stored.vaultPath,
+				embedMarkdown: embed,
+				pending: true,
+			}),
+			fields: {
+				source: "mobile-voice",
+				transcribe_status: "pending",
+				audio_path: stored.vaultPath,
+			},
+		});
+
+		const jobId = shortId(createId(), 12);
+		const job: VoiceJob = {
+			id: jobId,
+			status: "pending",
+			progress: "音频已写入，排队转写…",
+			transcript: "",
+			warning: "",
+			path: item.path,
+			itemId: item.frontmatter.item_id,
+			title: itemDisplayName(item),
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+		};
+		this.voiceJobs.set(jobId, job);
+		this.pruneVoiceJobs();
+
 		this.pushRecent({
-			title: cap.item.frontmatter.title,
-			preview: tr.text.slice(0, 80),
-			path: cap.item.path,
-			organized: cap.organized,
-			at: new Date().toISOString(),
+			title: itemDisplayName(item),
+			preview: fileName,
+			path: item.path,
+			organized: false,
+			at: recentAt(body),
+			notebookId: meta.notebook_id,
+			notebookName: meta.name,
+			itemId: item.frontmatter.item_id,
+			itemTitle: itemDisplayName(item),
+			kind: "voice",
+			sourceLabel: fileName,
+			sourcePath: stored.vaultPath,
+			attachmentId: stored.id,
+			clientSourceId,
 		});
 		this.deps.onNoteWritten?.({
-			title: cap.item.frontmatter.title,
-			path: cap.item.path,
+			title: itemDisplayName(item),
+			path: item.path,
 		});
+
+		// Immediate success for transfer; STT continues in background
 		this.json(res, 200, {
 			ok: true,
-			transcript: tr.text,
-			title: cap.item.frontmatter.title,
-			path: cap.item.path,
-			organized: cap.organized,
-			error: cap.error,
+			appended: !created,
+			created,
+			jobId,
+			transcribeStatus: "pending",
+			transcript: "",
+			itemId: item.frontmatter.item_id,
+			title: itemDisplayName(item),
+			path: item.path,
+			vaultPath: stored.vaultPath,
+			attachmentId: stored.id,
+			clientSourceId,
+			organized: false,
+			message: "传输成功，转写进行中",
 		});
+
+		void this.runMobileVoiceSttJob({
+			jobId,
+			meta,
+			itemId: item.frontmatter.item_id,
+			blob,
+			fileName,
+			arrayBuffer: ab,
+			vaultPath: stored.vaultPath,
+			embed,
+		});
+	}
+
+	private async runMobileVoiceSttJob(input: {
+		jobId: string;
+		meta: NotebookMeta;
+		itemId: string;
+		blob: Blob;
+		fileName: string;
+		arrayBuffer: ArrayBuffer;
+		vaultPath: string;
+		embed: string;
+	}): Promise<void> {
+		const job = this.voiceJobs.get(input.jobId);
+		if (!job) return;
+		const setJob = (patch: Partial<VoiceJob>) => {
+			const cur = this.voiceJobs.get(input.jobId);
+			if (!cur) return;
+			this.voiceJobs.set(input.jobId, {
+				...cur,
+				...patch,
+				updatedAt: Date.now(),
+			});
+		};
+		setJob({ status: "running", progress: "开始转写…" });
+
+		const pipe = this.deps.voicePipeline;
+		if (!pipe) {
+			const stt = await this.pollVoiceTranscription(
+				input.blob,
+				input.fileName,
+				input.meta,
+			);
+			await this.finalizeMobileVoiceStt({
+				jobId: input.jobId,
+				meta: input.meta,
+				itemId: input.itemId,
+				embed: input.embed,
+				vaultPath: input.vaultPath,
+				transcript: stt.transcript,
+				warning: stt.warning,
+				polished: "",
+			});
+			return;
+		}
+
+		try {
+			const result = await pipe.process(
+				input.meta,
+				input.blob,
+				input.fileName,
+				{
+					existing: {
+						vaultPath: input.vaultPath,
+						arrayBuffer: input.arrayBuffer,
+					},
+					onProgress: (msg) => setJob({ progress: msg }),
+				},
+			);
+			// Keep original mobile embed so we can surgically patch the same block
+			await this.finalizeMobileVoiceStt({
+				jobId: input.jobId,
+				meta: input.meta,
+				itemId: input.itemId,
+				embed: input.embed,
+				vaultPath: input.vaultPath,
+				transcript: result.ok ? result.transcript : "",
+				warning: result.ok
+					? ""
+					: shortWarn(
+							[result.error, result.errorDetail]
+								.filter(Boolean)
+								.join(" · ") || "自动转写未成功",
+						),
+				polished: result.polished || "",
+			});
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			await this.finalizeMobileVoiceStt({
+				jobId: input.jobId,
+				meta: input.meta,
+				itemId: input.itemId,
+				embed: input.embed,
+				vaultPath: input.vaultPath,
+				transcript: "",
+				warning: shortWarn(msg),
+				polished: "",
+			});
+		}
+	}
+
+	private async finalizeMobileVoiceStt(input: {
+		jobId: string;
+		meta: NotebookMeta;
+		itemId: string;
+		embed: string;
+		vaultPath: string;
+		transcript: string;
+		warning: string;
+		polished: string;
+	}): Promise<void> {
+		const key = input.meta.notebook_id + ":" + input.itemId;
+		const previous = this.voiceWriteTails.get(key) ?? Promise.resolve();
+		const current = previous.then(() => this.finalizeMobileVoiceSttInternal(input));
+		this.voiceWriteTails.set(key, current.catch(() => undefined));
+		try {
+			await current;
+		} finally {
+			if (this.voiceWriteTails.get(key) === current) this.voiceWriteTails.delete(key);
+		}
+	}
+
+	private async finalizeMobileVoiceSttInternal(input: {
+		jobId: string;
+		meta: NotebookMeta;
+		itemId: string;
+		embed: string;
+		vaultPath: string;
+		transcript: string;
+		warning: string;
+		polished: string;
+	}): Promise<void> {
+		const job = this.voiceJobs.get(input.jobId);
+		try {
+			// Re-read item so concurrent mobile writes are preserved
+			const item = await this.deps.items.findById(input.meta, input.itemId);
+			if (!item) {
+				if (job) {
+					this.voiceJobs.set(input.jobId, {
+						...job,
+						status: "failed",
+						progress: "条目已不存在，无法写回转写",
+						warning: "条目不存在",
+						updatedAt: Date.now(),
+					});
+				}
+				return;
+			}
+
+			const raw = (input.transcript || "").trim();
+			if (raw) {
+				try {
+					await this.deps.inbox.saveVoiceRaw(raw);
+				} catch {
+					/* ignore */
+				}
+			}
+
+			const nextBody = applyMobileVoiceSttToBody(item.body || "", {
+				embed: input.embed,
+				vaultPath: input.vaultPath,
+				transcript: raw,
+				polished: (input.polished || "").trim(),
+				warning: input.warning || "",
+			});
+			if (nextBody === (item.body || "") && !nextBody.includes(input.vaultPath)) {
+				throw new Error("语音块已删除或无法定位");
+			}
+
+			const updated = await this.deps.items.updateItem(item, {
+				body: nextBody,
+				fields: {
+					source: "mobile-voice",
+					transcribe_status: raw ? "done" : "failed",
+					audio_path: input.vaultPath,
+				},
+			});
+
+			if (job) {
+				this.voiceJobs.set(input.jobId, {
+					...job,
+					status: raw ? "done" : "failed",
+					progress: raw ? "转写完成" : "转写失败（录音已保留）",
+					transcript: raw,
+					warning: raw ? "" : input.warning,
+					path: updated.path,
+					title: itemDisplayName(updated),
+					updatedAt: Date.now(),
+				});
+			}
+			this.deps.onNoteWritten?.({
+				title: itemDisplayName(updated),
+				path: updated.path,
+			});
+		} catch (e) {
+			if (job) {
+				const msg = shortWarn(e instanceof Error ? e.message : String(e));
+				this.voiceJobs.set(input.jobId, {
+					...job,
+					status: "failed",
+					progress: msg,
+					warning: msg,
+					updatedAt: Date.now(),
+				});
+			}
+		}
+	}
+
+	private pruneVoiceJobs(): void {
+		const maxAge = 2 * 60 * 60 * 1000;
+		const now = Date.now();
+		for (const [id, j] of this.voiceJobs) {
+			if (now - j.createdAt > maxAge) this.voiceJobs.delete(id);
+		}
+		if (this.voiceJobs.size > 80) {
+			const sorted = [...this.voiceJobs.entries()].sort(
+				(a, b) => a[1].createdAt - b[1].createdAt,
+			);
+			for (const [id] of sorted.slice(0, this.voiceJobs.size - 60)) {
+				this.voiceJobs.delete(id);
+			}
+		}
+	}
+
+
+	private async pollVoiceTranscription(
+		blob: Blob,
+		fileName: string,
+		meta: NotebookMeta | null,
+	): Promise<{ transcript: string; warning: string }> {
+		const chain =
+			this.deps.resolveVoiceChain?.(meta) ||
+			(() => {
+				const one = this.deps.resolveVoice(meta);
+				return one ? [{ profile: one.profile, model: one.model }] : [];
+			})();
+		if (!chain.length) {
+			return {
+				transcript: "",
+				warning: "未配置语音转写 Provider（设置 → 用途「语音转写」）",
+			};
+		}
+		const errors: string[] = [];
+		for (let i = 0; i < chain.length; i++) {
+			const cand = chain[i]!;
+			const model = (cand.model || "").trim() || "whisper-1";
+			const label = `${cand.profile.name || cand.profile.id}/${model}`;
+			try {
+				const tr = await this.deps.voice.transcribe(
+					cand.profile,
+					model,
+					blob,
+					fileName,
+				);
+				if (tr.ok && (tr.text || "").trim()) {
+					return { transcript: tr.text.trim(), warning: "" };
+				}
+				errors.push(
+					`${i + 1}/${chain.length} ${label}: ${tr.ok ? "空文本" : shortWarn(tr.error || "失败")}`,
+				);
+			} catch (e) {
+				errors.push(
+					`${i + 1}/${chain.length} ${label}: ${shortWarn(e instanceof Error ? e.message : String(e))}`,
+				);
+			}
+		}
+		return {
+			transcript: "",
+			warning: `语音链 ${chain.length} 个候选均失败：${errors.slice(0, 4).join(" | ")}`,
+		};
 	}
 
 	private async handleFile(
 		res: ServerResponse,
 		body: Record<string, unknown>,
 	): Promise<void> {
+		const clientSourceId = sanitizeClientSourceId(body.clientSourceId);
 		const b64 = String(body.fileBase64 ?? "");
 		if (!b64) {
 			this.json(res, 400, { ok: false, error: "缺少 fileBase64" });
@@ -754,9 +1185,7 @@ export class MobileBridgeServer {
 			return;
 		}
 
-const meta = itemId
-			? await this.resolveStrictNotebook(notebookId)
-			: await this.deps.resolveNotebookById(notebookId);
+const meta = await this.resolveStrictNotebook(notebookId);
 		const ab = buf.buffer.slice(
 			buf.byteOffset,
 			buf.byteOffset + buf.byteLength,
@@ -815,7 +1244,7 @@ const meta = itemId
 			data: ab,
 			mime,
 			item_id: item.frontmatter.item_id,
-			itemName: item.frontmatter.title,
+			itemName: itemDisplayName(item),
 			kind: "backup",
 			origin: "mobile-upload",
 		});
@@ -840,24 +1269,34 @@ const meta = itemId
 			  });
 
 		this.pushRecent({
-			title: updated.frontmatter.title,
+			title: itemDisplayName(updated),
 			preview: fileName,
 			path: updated.path,
 			organized: false,
 			at: new Date().toISOString(),
+			notebookId: meta.notebook_id,
+			notebookName: meta.name,
+			itemId: updated.frontmatter.item_id,
+			itemTitle: itemDisplayName(updated),
+			kind: "file",
+			sourceLabel: fileName,
+			sourcePath: stored.vaultPath,
+			attachmentId: stored.id,
+			clientSourceId,
 		});
 		this.deps.onNoteWritten?.({
-			title: updated.frontmatter.title,
+			title: itemDisplayName(updated),
 			path: updated.path,
 		});
 		this.json(res, 200, {
 			ok: true,
 			appended: !created,
 			itemId: updated.frontmatter.item_id,
-			title: updated.frontmatter.title,
+			title: itemDisplayName(updated),
 			path: updated.path,
 			vaultPath: stored.vaultPath,
 			attachmentId: stored.id,
+			clientSourceId,
 			fileName,
 			size: buf.length,
 			mime,
@@ -960,9 +1399,11 @@ function itemPayload(item: NotebookItem): {
 	updated: string;
 	preview: string;
 } {
+	const fileTitle = itemBasename(item.path);
 	return {
 		id: item.frontmatter.item_id,
-		title: item.frontmatter.title,
+		// Primary label for App/pickers: vault file name under items/
+		title: fileTitle || item.frontmatter.title || "未命名",
 		path: item.path,
 		created: item.frontmatter.created,
 		updated: item.frontmatter.updated,
@@ -982,6 +1423,143 @@ function pickItemId(body: Record<string, unknown>): string | null {
 	if (raw == null) return null;
 	const s = String(raw).trim();
 	return s || null;
+}
+
+/** Strip HTML / cap length for UI-facing warnings. */
+
+/**
+ * Surgically write STT result next to THIS voice embed.
+ * NEVER replaces the whole note body — preserves prior text / files / other voices.
+ */
+function applyMobileVoiceSttToBody(
+	oldBody: string,
+	opts: {
+		embed: string;
+		vaultPath: string;
+		transcript: string;
+		polished: string;
+		warning: string;
+	},
+): string {
+	const updated = applyRetranscribeToBody(oldBody || "", {
+		vaultPath: opts.vaultPath,
+		transcript: opts.transcript,
+		polished: opts.polished,
+		warning: opts.warning,
+	});
+	if (updated !== oldBody) return updated;
+	// The audio was just attached; fail closed if an external edit removed it.
+	return oldBody;
+}
+
+function buildMobileSttBlock(opts: {
+	transcript: string;
+	polished: string;
+	warning: string;
+}): string {
+	const raw = (opts.transcript || "").trim();
+	if (raw) {
+		const polished = (opts.polished || "").trim();
+		const parts = ["### 语音转写", "", raw];
+		if (polished && polished !== raw) {
+			parts.push("", "### 润色", "", polished);
+		}
+		return parts.join("\n");
+	}
+	const warn = shortWarn(opts.warning || "全部候选失败");
+	return `> ⚠️ 转写失败：${warn}（录音已保留）`;
+}
+
+/** Unique strings that identify this voice attachment in the note body. */
+function collectEmbedMarkers(embed: string, vaultPath: string): string[] {
+	const out: string[] = [];
+	const idMatch = embed.match(/ai-notebook-attachment:([a-f0-9-]+)/i);
+	if (idMatch) out.push(`ai-notebook-attachment:${idMatch[1]}`);
+	const path = (vaultPath || "").replace(/\\/g, "/").trim();
+	if (path) {
+		out.push(`![[${path}]]`);
+		out.push(path);
+	}
+	// Full embed first line as weak fallback
+	const firstLine = (embed || "").split("\n").find((l) => l.trim());
+	if (firstLine && firstLine.trim().length >= 12) out.push(firstLine.trim());
+	return [...new Set(out.filter(Boolean))];
+}
+
+function findEmbedAnchor(
+	body: string,
+	markers: string[],
+): { start: number; end: number } | null {
+	for (const mk of markers) {
+		const idx = body.indexOf(mk);
+		if (idx < 0) continue;
+		// Expand to cover the embed block: from line start of marker,
+		// through following ![[...]] / caption lines until blank-blank or pending/heading.
+		let start = body.lastIndexOf("\n", idx);
+		start = start < 0 ? 0 : start + 1;
+		// If HTML comment is on previous line, include it
+		if (start > 0) {
+			const prevNl = body.lastIndexOf("\n", start - 2);
+			const prevLine = body.slice(prevNl < 0 ? 0 : prevNl + 1, start - 1);
+			if (/ai-notebook-attachment:/i.test(prevLine)) {
+				start = prevNl < 0 ? 0 : prevNl + 1;
+			}
+		}
+		let end = idx + mk.length;
+		// Consume rest of current line + a few following non-structural lines of the embed
+		const afterMarker = body.slice(end);
+		const lineEnd = afterMarker.indexOf("\n");
+		if (lineEnd >= 0) end += lineEnd + 1;
+		else end = body.length;
+		// Include subsequent lines that are part of embed (media / caption), stop at pending or ##
+		let guard = 0;
+		while (guard++ < 6 && end < body.length) {
+			const rest = body.slice(end);
+			const nl = rest.indexOf("\n");
+			const line = nl < 0 ? rest : rest.slice(0, nl);
+			const trimmed = line.trim();
+			if (!trimmed) {
+				// single blank stays with embed; stop before double or content
+				end += nl < 0 ? rest.length : nl + 1;
+				const next = body.slice(end);
+				const n2 = next.indexOf("\n");
+				const nextLine = (n2 < 0 ? next : next.slice(0, n2)).trim();
+				if (
+					!nextLine ||
+					nextLine.startsWith(">") ||
+					nextLine.startsWith("#") ||
+					nextLine.startsWith("<!--")
+				) {
+					break;
+				}
+				// caption line without markdown heading — include one
+				if (!/^!\[\[/.test(nextLine) && !/^\[\[/.test(nextLine)) {
+					end += n2 < 0 ? next.length : n2 + 1;
+				}
+				break;
+			}
+			if (
+				trimmed.startsWith(">") ||
+				trimmed.startsWith("#") ||
+				/ai-notebook-attachment:/i.test(trimmed)
+			) {
+				break;
+			}
+			// media / caption line
+			end += nl < 0 ? rest.length : nl + 1;
+			if (nl < 0) break;
+		}
+		return { start, end };
+	}
+	return null;
+}
+
+function shortWarn(msg: string): string {
+	return String(msg || "")
+		.replace(/<[^>]+>/g, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.slice(0, 160);
 }
 
 function pickTemplateId(body: Record<string, unknown>): TemplateId {
@@ -1018,6 +1596,13 @@ function recentAt(body: Record<string, unknown>): string {
 		if (!Number.isNaN(d.getTime())) return d.toISOString();
 	}
 	return new Date().toISOString();
+}
+
+function sanitizeClientSourceId(value: unknown): string {
+	return String(value ?? "")
+		.trim()
+		.replace(/[^A-Za-z0-9._-]/g, "")
+		.slice(0, 80);
 }
 
 function sanitizeUploadName(name: string): string {

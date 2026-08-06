@@ -7,6 +7,7 @@ import type {
 import { joinPath, structuredAttachmentsDir } from "../infra/paths";
 import type { IVaultFs } from "../infra/vaultPort";
 import type { ItemService } from "./itemService";
+import { itemDisplayName } from "./itemDisplayName";
 import type { CabinetService } from "./cabinetService";
 import type { AttachmentService } from "./attachmentService";
 import { buildAttachmentEmbedMarkdown } from "./attachmentService";
@@ -452,7 +453,7 @@ export class AssistantActionRunner {
 						data: file.data,
 						mime: file.mime,
 						item_id: target.frontmatter.item_id,
-						itemName: target.frontmatter.title,
+						itemName: itemDisplayName(target),
 						kind: "embedded",
 						origin: "assistant-embed",
 					});
@@ -510,7 +511,7 @@ export class AssistantActionRunner {
 						data: file.data,
 						mime: file.mime,
 						item_id: target?.frontmatter.item_id ?? null,
-						itemName: target?.frontmatter.title ?? null,
+						itemName: target ? itemDisplayName(target) : null,
 						kind: "backup",
 						origin: "assistant-cabinet",
 					});

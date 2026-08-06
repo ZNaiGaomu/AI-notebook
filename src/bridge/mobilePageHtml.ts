@@ -185,9 +185,9 @@ button:disabled{opacity:.45}
 
   <div id="tab-recent" class="hidden">
     <div class="card">
-      <label>最近写入（电脑端）</label>
+      <label>最近写入（按记录本 → 条目）</label>
       <div class="row"><button id="btnRefresh" class="secondary" type="button">刷新列表</button></div>
-      <ul class="recent" id="recent"></ul>
+      <div id="recent" class="recent-tree"></div>
     </div>
   </div>
 
@@ -205,6 +205,12 @@ let notebooksState = (NOTEBOOKS || []).slice();
 let itemsState = [];
 const DB_NAME = "ai-notebook-mobile-v1";
 const TRASH_MS = 30 * 24 * 60 * 60 * 1000;
+/** 0 = permanent (default). N = move queue items older than N days into trash. */
+var QUEUE_RETENTION_DAYS = 0;
+try {
+  var _rd = localStorage.getItem("ai-nb-queue-retention-days");
+  if (_rd != null && _rd !== "") QUEUE_RETENTION_DAYS = Math.max(0, parseInt(_rd, 10) || 0);
+} catch (e) {}
 let lanOk = false;
 let selectedNb = DEFAULT_NB || (notebooksState[0] && notebooksState[0].id) || "";
 let selectedItem = "";
@@ -1301,6 +1307,7 @@ document.getElementById("btnVoiceInbox").onclick = async function() {
     setVoiceActions(false);
     setVoiceReady("");
     setStatus("未连局域网：已缓存", "err");
+    return;
   }
   try {
     var r = await api("/api/voice", {
@@ -1392,23 +1399,116 @@ async function refreshRecent() {
   if (!lanOk) return;
   try {
     var r = await api("/api/recent");
-    var ul = document.getElementById("recent");
-    ul.innerHTML = "";
-    (r.items || []).forEach(function(it) {
-      var li = document.createElement("li");
-      var when = "";
-      if (it.at) {
-        try { when = new Date(it.at).toLocaleString(); } catch (e) { when = String(it.at); }
-      }
-      li.innerHTML = "<strong>" + esc(it.title) + "</strong>" +
-        (it.organized ? '<span class="badge">AI</span>' : "") +
-        (when ? "<div class='meta'>时间 " + esc(when) + "</div>" : "") +
-        "<div class='meta'>" + esc(it.preview || "") + "</div>";
-      ul.appendChild(li);
+    var root = document.getElementById("recent");
+    root.innerHTML = "";
+    var items = r.items || [];
+    if (!items.length) {
+      root.innerHTML = "<div class='meta'>暂无最近写入</div>";
+      return;
+    }
+    // Group: notebook → item → entries
+    var nbMap = {};
+    items.forEach(function(it) {
+      var nbKey = it.notebookId || it.notebookName || "_unknown";
+      var nbName = it.notebookName || (it.notebookId ? ("记录本 " + it.notebookId) : "未分类");
+      if (!nbMap[nbKey]) nbMap[nbKey] = { name: nbName, items: {} };
+      var itKey = it.itemId || it.itemTitle || it.path || it.title || Math.random().toString(36);
+      var itName = it.itemTitle || it.title || "未命名条目";
+      if (!nbMap[nbKey].items[itKey]) nbMap[nbKey].items[itKey] = { name: itName, rows: [] };
+      nbMap[nbKey].items[itKey].rows.push(it);
+    });
+    Object.keys(nbMap).forEach(function(nbKey) {
+      var nb = nbMap[nbKey];
+      var det = document.createElement("details");
+      det.open = true;
+      det.style.marginBottom = "10px";
+      var sum = document.createElement("summary");
+      sum.style.cursor = "pointer";
+      sum.style.fontWeight = "600";
+      sum.textContent = "📓 " + nb.name;
+      det.appendChild(sum);
+      Object.keys(nb.items).forEach(function(itKey) {
+        var ig = nb.items[itKey];
+        var idet = document.createElement("details");
+        idet.open = true;
+        idet.style.margin = "6px 0 6px 12px";
+        var isum = document.createElement("summary");
+        isum.style.cursor = "pointer";
+        isum.textContent = "📄 " + ig.name + "（" + ig.rows.length + "）";
+        idet.appendChild(isum);
+        var ul = document.createElement("ul");
+        ul.className = "recent";
+        ul.style.marginLeft = "8px";
+        ig.rows.forEach(function(it) {
+          var li = document.createElement("li");
+          var when = "";
+          if (it.at) {
+            try { when = new Date(it.at).toLocaleString(); } catch (e) { when = String(it.at); }
+          }
+          li.innerHTML = (function(){
+            var what = it.sourceLabel || it.preview || it.title || "";
+            var dest = it.path || "";
+            var srcPath = it.sourcePath || "";
+            return (it.kind ? '<span class="badge">' + esc(it.kind) + '</span> ' : '') +
+              (it.organized ? '<span class="badge">AI</span> ' : '') +
+              (when ? "<div class='meta'>时间 " + esc(when) + "</div>" : "") +
+              "<div class='meta'><b>传了什么</b> " + esc(what) + "</div>" +
+              (srcPath ? "<div class='meta'><b>来源文件</b> " + esc(srcPath) + "</div>" : "") +
+              (dest ? "<div class='meta'><b>去处</b> " + esc(dest) + "</div>" : "") +
+              ((it.notebookName || it.itemTitle)
+                ? "<div class='meta'>" + esc([it.notebookName, it.itemTitle].filter(Boolean).join(" → ")) + "</div>"
+                : "");
+          })();
+          ul.appendChild(li);
+        });
+        idet.appendChild(ul);
+        det.appendChild(idet);
+      });
+      root.appendChild(det);
     });
   } catch (e) {}
 }
 document.getElementById("btnRefresh").onclick = function() { refreshRecent(); };
+
+async function applyQueueRetention() {
+  if (!QUEUE_RETENTION_DAYS || QUEUE_RETENTION_DAYS <= 0) return;
+  var ms = QUEUE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  var now = Date.now();
+  var all = await storeAll("queue");
+  for (var i = 0; i < all.length; i++) {
+    var it = all[i];
+    var t = it.createdAt || it.capturedAt || 0;
+    if (t && now - t > ms) {
+      it.trashedAt = now;
+      await storePut("trash", it);
+      await storeDel("queue", it.id);
+    }
+  }
+}
+
+function bindQueueRetentionUi() {
+  var host = document.getElementById("tab-queue");
+  if (!host || document.getElementById("queueRetention")) return;
+  var card = host.querySelector(".card");
+  if (!card) return;
+  var box = document.createElement("div");
+  box.style.marginTop = "10px";
+  box.innerHTML = '<label for="queueRetention">待发送自动清理（过期移入垃圾箱；0=永久）</label>' +
+    '<select id="queueRetention" style="width:100%;margin-top:6px">' +
+    '<option value="0">永久保留（默认）</option>' +
+    '<option value="7">7 天后移入垃圾箱</option>' +
+    '<option value="30">30 天后移入垃圾箱</option>' +
+    '<option value="90">90 天后移入垃圾箱</option>' +
+    '</select>';
+  card.appendChild(box);
+  var sel = document.getElementById("queueRetention");
+  sel.value = String(QUEUE_RETENTION_DAYS || 0);
+  sel.onchange = function() {
+    QUEUE_RETENTION_DAYS = parseInt(sel.value, 10) || 0;
+    try { localStorage.setItem("ai-nb-queue-retention-days", String(QUEUE_RETENTION_DAYS)); } catch (e) {}
+    applyQueueRetention().then(function(){ renderQueue(); }).catch(function(){});
+  };
+}
 
 try { fillNotebooks(NOTEBOOKS, DEFAULT_NB); } catch (e) {}
 // Page was served by desktop bridge with token => already connected (don't stick on 检测中)
@@ -1425,6 +1525,8 @@ try { fillNotebooks(NOTEBOOKS, DEFAULT_NB); } catch (e) {}
   setTimeout(function(){ refreshLan(); }, 600);
 })();
 try { purgeExpiredTrash(); } catch (e) {}
+try { bindQueueRetentionUi(); } catch (e) {}
+try { applyQueueRetention().then(function(){ renderQueue(); }).catch(function(){}); } catch (e) {}
 </script>
 </body>
 </html>`;

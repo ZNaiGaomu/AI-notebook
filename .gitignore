@@ -12,3 +12,13 @@ scripts/_*
 
 # Keep packaged release runtime files in GitHub install folder.
 !release/**/main.js
+
+# Local Claude session data.
+.claude/
+
+# Android local state, generated builds, downloaded tools, and staged binaries.
+release/app/.gradle/
+release/app/**/build/
+release/app/local.properties
+release/app/tools/
+release/app/dist/

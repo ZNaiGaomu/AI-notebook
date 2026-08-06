@@ -178,6 +178,7 @@ describe("mobile bridge live connectivity", () => {
 		// must not have the broken binding that killed all JS
 		expect(script).not.toContain('getElementById("btnDelSel".onclick');
 		expect(script).toContain('getElementById("btnDelSel").onclick');
+		expect(script).toMatch(/未连局域网：已缓存[\s\S]*?return;[\s\S]*?api\("\/api\/voice"/);
 		// must boot to connected when token present
 		expect(script).toContain("已连接电脑");
 		expect(() => new Function(script)).not.toThrow();
@@ -206,6 +207,23 @@ describe("mobile bridge live connectivity", () => {
 
 		const noTok = await httpGet(port, `/api/status`);
 		expect(noTok.status).toBe(401);
+	});
+
+	it("does not redirect stale explicit notebook ids to the default notebook", async () => {
+		await server.start();
+		const beforeInbox = inboxWrites;
+		const response = await httpPost(port, `/api/text?t=${token}`, {
+			text: "stale target",
+			organize: true,
+			notebook_id: "missing-notebook",
+		});
+		expect(response.status).toBe(200);
+		expect(JSON.parse(response.body)).toMatchObject({
+			ok: true,
+			organized: false,
+			warning: "无记录本，已写入收件箱",
+		});
+		expect(inboxWrites).toBe(beforeInbox + 1);
 	});
 
 	it("stores file inbox submissions as notes without importing binaries", async () => {

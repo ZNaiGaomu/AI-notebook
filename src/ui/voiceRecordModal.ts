@@ -15,6 +15,8 @@ export type VoiceRecordResult =
 /**
  * Start/stop voice recorder with configurable container format.
  */
+export type VoiceTargetOption = { id: string; title: string };
+
 export class VoiceRecordModal extends Modal {
 	private resolveFn: ((r: VoiceRecordResult) => void) | null = null;
 	private capture: MediaRecordHandle | null = null;
@@ -25,13 +27,23 @@ export class VoiceRecordModal extends Modal {
 	private statusEl: HTMLElement | null = null;
 	private recording = false;
 	private negotiated: NegotiatedRecordFormat;
+	/** "" = create new item; otherwise append to existing item id */
+	private selectedTargetId = "";
 
 	constructor(
 		app: App,
 		private readonly formatPref: VoiceRecordFormat = "auto",
+		private readonly targetOptions: VoiceTargetOption[] = [],
+		private readonly defaultTargetId: string = "",
 	) {
 		super(app);
 		this.negotiated = negotiateRecordFormat(formatPref);
+		this.selectedTargetId = defaultTargetId || "";
+	}
+
+	/** Selected target after close (only meaningful on ok result). */
+	getSelectedTargetId(): string {
+		return this.selectedTargetId;
 	}
 
 	waitForResult(): Promise<VoiceRecordResult> {
@@ -48,6 +60,39 @@ export class VoiceRecordModal extends Modal {
 		contentEl.createEl("p", {
 			text: `点击开始录音，说完后点停止。当前格式：${this.negotiated.label}（可在设置中更改）。`,
 			cls: "setting-item-description",
+		});
+
+		// Target: new item vs append to existing
+		const targetWrap = contentEl.createDiv({ cls: "setting-item" });
+		const targetInfo = targetWrap.createDiv({ cls: "setting-item-info" });
+		targetInfo.createDiv({
+			cls: "setting-item-name",
+			text: "写入目标",
+		});
+		targetInfo.createDiv({
+			cls: "setting-item-description",
+			text: "可新建条目，或追加到已有条目正文末尾。",
+		});
+		const targetControl = targetWrap.createDiv({
+			cls: "setting-item-control",
+		});
+		const select = targetControl.createEl("select");
+		select.style.minWidth = "220px";
+		const optNew = select.createEl("option", {
+			text: "＋ 新建条目（默认）",
+			attr: { value: "" },
+		});
+		// Obsidian createEl option value
+		(optNew as HTMLOptionElement).value = "";
+		for (const t of this.targetOptions) {
+			const o = select.createEl("option", {
+				text: t.title || "未命名",
+			});
+			(o as HTMLOptionElement).value = t.id;
+		}
+		select.value = this.selectedTargetId;
+		select.addEventListener("change", () => {
+			this.selectedTargetId = select.value || "";
 		});
 
 		const mic = canUseMicrophone();

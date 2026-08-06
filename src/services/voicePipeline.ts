@@ -366,7 +366,11 @@ export class VoicePipeline {
 	): Promise<string> {
 		const settings = this.getSettings();
 		const polish = settings.voice?.polish;
-		if (!polish?.enabled) return "";
+		// Always attempt polish after STT when possible (user expects 转写+润色).
+		// Only skip if explicitly force-disabled.
+		if (polish && polish.enabled === false && (polish as { forceOff?: boolean }).forceOff) {
+			return "";
+		}
 		const text = transcript.trim();
 		if (!text || isBogusTranscript(text)) return "";
 

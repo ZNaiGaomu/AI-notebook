@@ -1,3 +1,4 @@
+import { itemDisplayName } from "./itemDisplayName";
 import type {
 	AiNotebookSettings,
 	Blueprint,
@@ -420,7 +421,7 @@ function sortItems(
 	copy.sort((a, b) => {
 		switch (sort) {
 			case "title_asc":
-				return a.frontmatter.title.localeCompare(b.frontmatter.title, "zh");
+				return itemDisplayName(a).localeCompare(itemDisplayName(b), "zh");
 			case "created_desc":
 				return (b.frontmatter.created || "").localeCompare(
 					a.frontmatter.created || "",

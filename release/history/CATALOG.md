@@ -11,3 +11,4 @@
 | 0.4.0 | release/history/v0.4.0/ |
 | 0.5.0 | release/history/v0.5.0/ |
 | 0.6.0 | release/history/v0.6.0/ |
+| 0.7.0 | release/history/v0.7.0/ |
