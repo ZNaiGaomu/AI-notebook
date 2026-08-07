@@ -1,7 +1,9 @@
 package com.gaomu.suji.workshop.ui
 
 import android.app.Application
+import android.content.Intent
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -16,8 +18,9 @@ import com.gaomu.suji.workshop.util.LinkParser
 import com.gaomu.suji.workshop.voice.AudioRecorder
 import com.gaomu.suji.workshop.data.repo.LocalRecentStore
 import com.gaomu.suji.workshop.data.repo.LocalRecentEntry
+import com.gaomu.suji.workshop.data.repo.OriginalSourceMetadata
+import com.gaomu.suji.workshop.data.repo.originalSourceMetadataMatches
 import com.gaomu.suji.workshop.voice.RecordedClip
-import android.content.Intent
 import androidx.core.content.FileProvider
 import com.gaomu.suji.workshop.data.source.isAppOwnedSource
 import com.gaomu.suji.workshop.data.source.distinctUriStrings
@@ -562,11 +565,15 @@ class SujiViewModel(app: Application) : AndroidViewModel(app) {
             val app = getApplication<Application>()
             val cr = app.contentResolver
             for (uri in distinctUriStrings(uris.map(Uri::toString)).map(Uri::parse)) {
+                var queriedSize = -1L
                 val name =
                     runCatching {
                         cr.query(uri, null, null, null, null)?.use { c ->
+                            if (!c.moveToFirst()) return@use null
+                            val sizeIdx = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                            if (sizeIdx >= 0 && !c.isNull(sizeIdx)) queriedSize = c.getLong(sizeIdx)
                             val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                            if (c.moveToFirst() && idx >= 0) c.getString(idx) else null
+                            if (idx >= 0) c.getString(idx) else null
                         }
                     }.getOrNull() ?: "file"
                 val mime = cr.getType(uri) ?: "application/octet-stream"
@@ -575,6 +582,7 @@ class SujiViewModel(app: Application) : AndroidViewModel(app) {
                     onResult(false)
                     continue
                 }
+                val originalSize = if (queriedSize > 0L) queriedSize else bytes.size.toLong()
                 val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
                 val localPath =
                     runCatching {
@@ -600,6 +608,7 @@ class SujiViewModel(app: Application) : AndroidViewModel(app) {
                         originalUriPersisted = cr.persistedUriPermissions.any { it.uri == uri && it.isReadPermission },
                         originalMimeType = mime,
                         originalDisplayName = name,
+                        originalSize = originalSize,
                     )
                 if (sendNow && _ui.value.connected) {
                     _ui.update { it.copy(busy = true, statusLine = "发送文件 $name …") }
@@ -623,6 +632,7 @@ class SujiViewModel(app: Application) : AndroidViewModel(app) {
                             originalUriPersisted = item.originalUriPersisted,
                             originalMimeType = item.originalMimeType,
                             originalDisplayName = item.originalDisplayName,
+                            originalSize = item.originalSize,
                             destPath = r.path,
                             itemTitle = r.title,
                             clientSourceId = r.clientSourceId.ifBlank { item.clientSourceId },
@@ -707,6 +717,7 @@ class SujiViewModel(app: Application) : AndroidViewModel(app) {
                             originalUriPersisted = it.originalUriPersisted,
                             originalMimeType = it.originalMimeType,
                             originalDisplayName = it.originalDisplayName,
+                            originalSize = it.originalSize,
                             destPath = response.path,
                             itemTitle = response.title,
                             clientSourceId = response.clientSourceId.ifBlank { it.clientSourceId },
@@ -769,6 +780,7 @@ class SujiViewModel(app: Application) : AndroidViewModel(app) {
         originalUriPersisted: Boolean = false,
         originalMimeType: String = "",
         originalDisplayName: String = "",
+        originalSize: Long = 0L,
         destPath: String = "",
         itemTitle: String = "",
         clientSourceId: String = "",
@@ -785,6 +797,7 @@ class SujiViewModel(app: Application) : AndroidViewModel(app) {
                 originalUriPersisted = originalUriPersisted,
                 originalMimeType = originalMimeType,
                 originalDisplayName = originalDisplayName,
+                originalSize = originalSize,
                 destPath = destPath,
                 notebookName = _ui.value.notebooks.find { it.id == _ui.value.selectedNotebookId }?.name.orEmpty(),
                 itemTitle = itemTitle.ifBlank {
@@ -794,32 +807,151 @@ class SujiViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    fun openOriginalSource(clientSourceId: String, kind: String, preview: String, destPath: String) {
+    fun openRecentFile(clientSourceId: String, kind: String, preview: String, destPath: String) {
+        viewModelScope.launch {
+            val entry = localRecent.findEntry(clientSourceId, kind, preview, destPath)
+            val hasLocal =
+                entry != null &&
+                    entry.localPath.isNotBlank() &&
+                    !entry.localCopyDeleted &&
+                    java.io.File(entry.localPath).exists()
+            if (hasLocal) {
+                openLocalSource(clientSourceId, kind, preview, destPath)
+                return@launch
+            }
+            if (entry?.originalUri?.isNotBlank() == true) {
+                openOriginalLocation(clientSourceId, kind, preview, destPath)
+                return@launch
+            }
+            // Fall back to local open attempt (covers voice copies still on disk lookup path).
+            openLocalSource(clientSourceId, kind, preview, destPath)
+        }
+    }
+
+    fun openOriginalLocation(clientSourceId: String, kind: String, preview: String, destPath: String) {
         viewModelScope.launch {
             val entry = localRecent.findEntry(clientSourceId, kind, preview, destPath)
             val source = entry ?: run {
-                _ui.update { it.copy(statusLine = "未记录原始文件 URI") }
+                _ui.update { it.copy(statusLine = "未记录原始文件位置") }
                 return@launch
             }
             val raw = source.originalUri
             if (raw.isBlank()) {
-                _ui.update { it.copy(statusLine = "未记录原始文件 URI") }
+                _ui.update { it.copy(statusLine = "未记录原始文件位置") }
                 return@launch
             }
-            try {
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(Uri.parse(raw), source.originalMimeType.ifBlank { "*/*" })
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            val uri = Uri.parse(raw)
+            if (!originalUriMatchesStored(uri, source)) {
+                _ui.update { it.copy(statusLine = "原始文件信息不匹配，已阻止打开；可打开手机副本") }
+                return@launch
+            }
+            if (tryOpenOriginalLocation(uri, source.originalMimeType)) {
+                _ui.update { it.copy(statusLine = "已尝试打开原文件位置") }
+            } else {
+                _ui.update { it.copy(statusLine = "系统不允许打开原文件位置，可改用手机副本") }
+            }
+        }
+    }
+
+    /** Conservative check: only reject when both sides have metadata and they disagree. */
+    private fun originalUriMatchesStored(uri: Uri, source: LocalRecentEntry): Boolean {
+        val app = getApplication<Application>()
+        val cr = app.contentResolver
+        val currentMime = runCatching { cr.getType(uri) }.getOrNull().orEmpty()
+        val meta =
+            runCatching {
+                cr.query(uri, null, null, null, null)?.use { c ->
+                    if (!c.moveToFirst()) return@use null
+                    val nameIdx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                    val name = if (nameIdx >= 0) c.getString(nameIdx).orEmpty() else ""
+                    val size = if (sizeIdx >= 0 && !c.isNull(sizeIdx)) c.getLong(sizeIdx) else -1L
+                    name to size
                 }
-                getApplication<Application>().startActivity(Intent.createChooser(intent, "打开原始文件"))
-            } catch (_: Exception) {
-                _ui.update { it.copy(statusLine = "原始文件不可用，仍可打开手机副本") }
+            }.getOrNull()
+        val (currentName, currentSize) = meta ?: ("" to -1L)
+        return originalSourceMetadataMatches(
+            stored =
+                OriginalSourceMetadata(
+                    displayName = source.originalDisplayName,
+                    size = source.originalSize,
+                    mimeType = source.originalMimeType,
+                ),
+            current =
+                OriginalSourceMetadata(
+                    displayName = currentName,
+                    size = currentSize,
+                    mimeType = currentMime,
+                ),
+        )
+    }
+
+    private fun tryOpenOriginalLocation(uri: Uri, mimeType: String): Boolean {
+        val app = getApplication<Application>()
+        val openOriginal =
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mimeType.ifBlank { app.contentResolver.getType(uri) ?: "*/*" })
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        val chooser =
+            Intent.createChooser(openOriginal, "打开原始文件").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        if (runCatching { app.startActivity(chooser) }.isSuccess) return true
+        return runCatching { app.startActivity(buildOriginalFolderIntent(uri)) }.isSuccess
+    }
+
+    private fun buildOriginalFolderIntent(uri: Uri): Intent =
+        Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            putExtra("android.provider.extra.SHOW_ADVANCED", true)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            parentDocumentUri(uri)?.let { putExtra(DocumentsContract.EXTRA_INITIAL_URI, it) }
+        }
+
+    private fun parentDocumentUri(uri: Uri): Uri? =
+        runCatching {
+            if (!DocumentsContract.isDocumentUri(getApplication<Application>(), uri)) return null
+            val documentId = DocumentsContract.getDocumentId(uri)
+            val parentId = documentId.substringBeforeLast('/', missingDelimiterValue = documentId)
+            if (parentId == documentId) return null
+            DocumentsContract.buildDocumentUriUsingTree(uri, parentId)
+        }.getOrNull()
+
+    fun deleteRecentRecords(rows: List<RecentDto>, removeQueueReferences: Boolean = false) {
+        viewModelScope.launch {
+            val localIds = rows.mapNotNull { row ->
+                val what = row.sourceLabel.ifBlank { row.preview.ifBlank { row.title } }
+                com.gaomu.suji.workshop.data.repo.matchLocalRecentEntry(
+                    _ui.value.localRecent,
+                    row.clientSourceId,
+                    row.kind,
+                    what,
+                    row.path,
+                )?.id
+            }.toSet()
+            if (localIds.isNotEmpty()) {
+                deleteRecentCopiesInternal(localIds, removeMetadata = true, removeQueueReferences = removeQueueReferences)
+            }
+            localRecent.hideRows(rows)
+            val refreshedLocal = localRecent.all()
+            val hiddenRecentKeys = localRecent.hiddenKeys()
+            _ui.update {
+                it.copy(
+                    localRecent = refreshedLocal,
+                    hiddenRecentKeys = hiddenRecentKeys,
+                    statusLine = "已移除手机本地最近记录 ${rows.size} 条，不影响电脑 vault",
+                )
             }
         }
     }
 
     fun deleteRecentCopies(ids: Set<String>, removeMetadata: Boolean, removeQueueReferences: Boolean = false) {
         viewModelScope.launch {
+            deleteRecentCopiesInternal(ids, removeMetadata, removeQueueReferences)
+        }
+    }
+
+    private suspend fun deleteRecentCopiesInternal(ids: Set<String>, removeMetadata: Boolean, removeQueueReferences: Boolean = false) {
             val entries = _ui.value.localRecent.filter { it.id in ids }
             val queueMatches = (_ui.value.queue + _ui.value.trash).filter { item ->
                 entries.any { entry ->
@@ -830,7 +962,7 @@ class SujiViewModel(app: Application) : AndroidViewModel(app) {
             }
             if (queueMatches.isNotEmpty() && !removeQueueReferences) {
                 _ui.update { it.copy(statusLine = "所选来源仍在待发送或垃圾箱中，已取消删除") }
-                return@launch
+                return
             }
             if (removeQueueReferences) {
                 queueRepo.remove(queueMatches.filter { it.id in _ui.value.queue.map { q -> q.id } }.map { it.id }.toSet())
@@ -885,7 +1017,6 @@ class SujiViewModel(app: Application) : AndroidViewModel(app) {
                     statusLine = "已删除手机副本 $deleted 个${if (removeMetadata) "，并移除对应最近记录" else "，最近记录已保留"}${if (failed > 0) "；失败 $failed 个" else ""}",
                 )
             }
-        }
     }
 
     /** Open phone-local original file from 最近. */

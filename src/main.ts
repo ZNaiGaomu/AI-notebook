@@ -46,6 +46,10 @@ import { PickNotebookModal } from "./ui/pickNotebookModal";
 import { BridgeLinkModal } from "./ui/bridgeLinkModal";
 import { UserConfigStore } from "./infra/userConfigStore";
 import { ChatHistoryStore } from "./services/chatHistoryStore";
+import {
+	itemDisplayName,
+	itemDisplayNameFromPath,
+} from "./services/itemDisplayName";
 import { syncPluginHistoryOnLoad } from "./services/pluginHistoryStore";
 import { PluginPackageArchive } from "./services/pluginPackageArchive";
 
@@ -390,7 +394,24 @@ this.addSettingTab(new AiNotebookSettingTab(this.app, this));
 		const newParts = np.slice(prefix.length).split("/").filter(Boolean);
 		const oldFolder = oldParts[0] || "";
 		const newFolder = newParts[0] || "";
-		if (!oldFolder || !newFolder || oldFolder === newFolder) return;
+		if (!oldFolder || !newFolder) return;
+
+		// Same notebook: handle items/*.md renames so managed attachments follow.
+		if (oldFolder === newFolder) {
+			const isItemMarkdownRename =
+				oldParts[1] === "items" &&
+				newParts[1] === "items" &&
+				oldParts.length === 3 &&
+				newParts.length === 3 &&
+				Boolean(oldParts[2]?.toLowerCase().endsWith(".md")) &&
+				Boolean(newParts[2]?.toLowerCase().endsWith(".md")) &&
+				oldParts[2] !== newParts[2];
+			if (isItemMarkdownRename) {
+				await this.syncAfterItemFileRename(newFolder, np, op);
+			}
+			return;
+		}
+
 		// Notebook folder rename: top-level segment under notebooks root changed
 		const meta = await this.notebooks.syncAfterFolderRename(
 			oldFolder,
@@ -405,6 +426,95 @@ this.addSettingTab(new AiNotebookSettingTab(this.app, this));
 			if (view instanceof NotebookView) {
 				await view.reload();
 			}
+		}
+	}
+
+	/** Move managed attachments and rewrite embeds when an items/*.md file is renamed. */
+	private async syncAfterItemFileRename(
+		notebookFolder: string,
+		itemPath: string,
+		oldItemPath: string,
+	): Promise<void> {
+		try {
+			const notebooks = await this.notebooks.listNotebooks();
+			const meta =
+				notebooks.find((n) => n.folderName === notebookFolder) ??
+				(await this.notebooks.readMeta(notebookFolder).catch(() => null));
+			if (!meta) return;
+			const items = await this.items.listItems(meta);
+			const item = items.find((it) => {
+				const a = it.path.replace(/\\/g, "/");
+				const b = itemPath.replace(/\\/g, "/");
+				return a === b;
+			});
+			if (!item) return;
+			const oldItemLabel = itemDisplayNameFromPath(oldItemPath);
+			const { syncAllItemFolderLayouts, applyPathRewrites } = await import(
+				"./services/itemFolderSync"
+			);
+			const { rewrites } = await syncAllItemFolderLayouts({
+				vault: this.vaultIo,
+				settings: this.settings,
+				meta,
+				item,
+				oldItemLabel,
+				attachments: this.attachments,
+				cabinet: this.cabinet,
+			});
+			if (rewrites.length) {
+				const body = applyPathRewrites(
+					this.attachments.rewriteEmbedPaths(item.body, rewrites),
+					rewrites,
+				);
+				const currentAudioPath = String(item.frontmatter.audio_path ?? "");
+				const rewrittenAudioPath = rewrites.reduce(
+					(path, rewrite) => (path === rewrite.from ? rewrite.to : path),
+					currentAudioPath,
+				);
+				if (body !== item.body || rewrittenAudioPath !== currentAudioPath) {
+					await this.items.updateItem(item, {
+						body,
+						...(rewrittenAudioPath !== currentAudioPath
+							? { fields: { audio_path: rewrittenAudioPath } }
+							: {}),
+					});
+				}
+				// Chat history attachment paths (assistant uploads under chat-uploads).
+				try {
+					const threads = await this.chatHistory.loadAll();
+					let changed = false;
+					const next = threads.map((t) => {
+						if (t.notebookId !== meta.notebook_id) return t;
+						const messages = t.messages.map((m) => {
+							if (!m.attachments?.length) return m;
+							const attachments = m.attachments.map((a) => {
+								const vaultPath = applyPathRewrites(a.vaultPath, rewrites);
+								if (vaultPath !== a.vaultPath) changed = true;
+								return vaultPath === a.vaultPath ? a : { ...a, vaultPath };
+							});
+							return { ...m, attachments };
+						});
+						const itemTitle =
+							t.itemId === item.frontmatter.item_id
+								? itemDisplayName(item)
+								: t.itemTitle;
+						if (itemTitle !== t.itemTitle) changed = true;
+						return { ...t, messages, itemTitle };
+					});
+					if (changed) await this.chatHistory.saveAll(next);
+				} catch {
+					/* best-effort */
+				}
+			}
+			const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_AI_NOTEBOOK);
+			for (const leaf of leaves) {
+				const view = leaf.view;
+				if (view instanceof NotebookView) {
+					await view.reload();
+				}
+			}
+		} catch {
+			// Best-effort; do not block Obsidian rename UX.
 		}
 	}
 

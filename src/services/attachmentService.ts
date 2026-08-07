@@ -250,7 +250,15 @@ export class AttachmentService {
 			);
 			const nextPath = joinPath(destDir, safeName);
 			if (!sameVaultPath(target.vaultPath, nextPath)) {
+				if (!(await this.vault.exists(target.vaultPath))) {
+					throw new Error("附件文件不存在，不能移动");
+				}
 				await this.vault.move(target.vaultPath, nextPath);
+				if (!(await this.vault.exists(nextPath))) {
+					throw new Error("附件移动失败，目标文件不存在");
+				}
+			} else if (!(await this.vault.exists(nextPath))) {
+				throw new Error("附件文件不存在，不能移动");
 			}
 			updated = {
 				...updated,
@@ -293,6 +301,8 @@ export class AttachmentService {
 			"items",
 		);
 		for (const folder of this.vault.listImmediateFolders(itemsRoot)) {
+			// Empty residue from an interrupted rename must not force a suffix.
+			if (!this.vault.listFilesInFolder(folder.path).length) continue;
 			used.add(folder.name);
 		}
 		let candidate = base;
@@ -350,10 +360,11 @@ export class AttachmentService {
 		);
 		if (!owned.length) return [];
 
-		const currentLabel =
+		const sameItemLabels = new Set(
 			owned
 				.map((r) => extractItemFolderLabel(r.vaultPath, meta.name))
-				.find((x): x is string => Boolean(x)) ?? null;
+				.filter((x): x is string => Boolean(x)),
+		);
 		const others = new Set<string>();
 		for (const rec of store.items) {
 			if (rec.item_id === itemId) continue;
@@ -366,7 +377,11 @@ export class AttachmentService {
 			"items",
 		);
 		for (const folder of this.vault.listImmediateFolders(itemsRoot)) {
-			if (folder.name !== currentLabel) others.add(folder.name);
+			if (sameItemLabels.has(folder.name)) continue;
+			// Empty leftover folders must not force a -2 suffix for this item.
+			const nested = this.vault.listFilesInFolder(folder.path);
+			if (!nested.length) continue;
+			others.add(folder.name);
 		}
 		let nextLabel = pathSegment(newTitle, "未命名条目");
 		let n = 2;
@@ -374,8 +389,13 @@ export class AttachmentService {
 		while (others.has(nextLabel)) {
 			nextLabel = `${baseLabel}-${n}`;
 			n += 1;
+			if (n > 200) break;
 		}
-		if (currentLabel && currentLabel === nextLabel) return [];
+		const alreadyOnNext = owned.every((r) => {
+			const label = extractItemFolderLabel(r.vaultPath, meta.name);
+			return label === nextLabel;
+		});
+		if (alreadyOnNext) return [];
 
 		const rewrites: Array<{ from: string; to: string }> = [];
 		const nextItems = [...store.items];
@@ -390,6 +410,14 @@ export class AttachmentService {
 				kind,
 			);
 			await this.vault.ensureFolder(destDir);
+			const currentLabel = extractItemFolderLabel(rec.vaultPath, meta.name);
+			if (currentLabel === nextLabel) {
+				const idx = nextItems.findIndex((x) => x.id === rec.id);
+				if (idx >= 0 && rec.managedRoot !== destDir) {
+					nextItems[idx] = { ...rec, managedRoot: destDir };
+				}
+				continue;
+			}
 			const baseName = sanitizeFileName(
 				rec.vaultPath.slice(rec.vaultPath.lastIndexOf("/") + 1) ||
 					rec.displayName,
@@ -398,12 +426,26 @@ export class AttachmentService {
 				this.vault.exists(joinPath(destDir, name)),
 			);
 			const nextPath = joinPath(destDir, safeName);
-			if (!sameVaultPath(rec.vaultPath, nextPath)) {
-				if (await this.vault.exists(rec.vaultPath)) {
-					await this.vault.move(rec.vaultPath, nextPath);
+			if (sameVaultPath(rec.vaultPath, nextPath)) {
+				const idx = nextItems.findIndex((x) => x.id === rec.id);
+				if (idx >= 0) {
+					nextItems[idx] = {
+						...rec,
+						vaultPath: nextPath,
+						managedRoot: destDir,
+					};
 				}
-				rewrites.push({ from: rec.vaultPath, to: nextPath });
+				continue;
 			}
+			if (!(await this.vault.exists(rec.vaultPath))) {
+				// Keep the stale index entry as-is; never rewrite body to a missing path.
+				continue;
+			}
+			await this.vault.move(rec.vaultPath, nextPath);
+			if (!(await this.vault.exists(nextPath))) {
+				continue;
+			}
+			rewrites.push({ from: rec.vaultPath, to: nextPath });
 			const idx = nextItems.findIndex((x) => x.id === rec.id);
 			if (idx >= 0) {
 				nextItems[idx] = {
@@ -413,7 +455,31 @@ export class AttachmentService {
 				};
 			}
 		}
-		await this.writeStore(meta.folderName, { items: nextItems });
+		const changed = nextItems.some((rec, i) => {
+				const prev = store.items[i];
+				return (
+					!prev ||
+					prev.id !== rec.id ||
+					prev.vaultPath !== rec.vaultPath ||
+					prev.managedRoot !== rec.managedRoot
+				);
+			});
+		if (rewrites.length || changed) {
+			await this.writeStore(meta.folderName, { items: nextItems });
+		}
+		if (rewrites.length && this.vault.removeEmptyFolder) {
+			const oldLabels = [...sameItemLabels].filter((label) => label !== nextLabel);
+			for (const label of oldLabels) {
+				const oldRoot = structuredItemAttachmentsRoot(
+					this.getSettings(),
+					meta.name,
+					label,
+				);
+				if (!this.vault.listFilesInFolder(oldRoot).length) {
+					await this.vault.removeEmptyFolder(oldRoot);
+				}
+			}
+		}
 		return rewrites;
 	}
 
@@ -503,6 +569,8 @@ export class AttachmentService {
 			if (!a || a === b) continue;
 			out = out.split(`![[${a}]]`).join(`![[${b}]]`);
 			out = out.split(`[[${a}]]`).join(`[[${b}]]`);
+			// Voice block markers keep an encoded copy of the same attachment path.
+			out = out.split(encodeURIComponent(a)).join(encodeURIComponent(b));
 			const base = a.slice(a.lastIndexOf("/") + 1);
 			if (base) {
 				out = out.split(`![[${base}]]`).join(`![[${b}]]`);

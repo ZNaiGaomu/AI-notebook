@@ -81,6 +81,14 @@ export class VaultIo implements IVaultFs {
 		if (f) await this.app.vault.trash(f, true);
 	}
 
+	async removeEmptyFolder(path: string): Promise<boolean> {
+		const folder = this.app.vault.getAbstractFileByPath(this.normalize(path));
+		if (!(folder instanceof TFolder)) return false;
+		if (this.listFilesInFolder(folder.path).length) return false;
+		await this.app.vault.trash(folder, true);
+		return true;
+	}
+
 	async move(from: string, to: string): Promise<void> {
 		const file = this.getFile(from);
 		if (!file) throw new Error(`File not found: ${from}`);

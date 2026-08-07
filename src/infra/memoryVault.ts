@@ -59,6 +59,15 @@ export class MemoryVault implements IVaultFs {
 		this.files.delete(p);
 	}
 
+	async removeEmptyFolder(path: string): Promise<boolean> {
+		const p = this.normalize(path);
+		if (!this.folders.has(p) || this.listFilesInFolder(p).length) return false;
+		for (const folder of [...this.folders]) {
+			if (folder === p || folder.startsWith(`${p}/`)) this.folders.delete(folder);
+		}
+		return true;
+	}
+
 	async move(from: string, to: string): Promise<void> {
 		const content = await this.read(from);
 		await this.write(to, content);

@@ -733,11 +733,23 @@ export class MobileBridgeServer {
 					title: `手机语音 ${new Date().toLocaleString()}`,
 					note: "无记录本：音频已进收件箱",
 				});
+				this.pushRecent({
+					title: "手机语音",
+					preview: fileName,
+					path: dumped.notePath,
+					organized: false,
+					at: recentAt(body),
+					kind: "voice",
+					sourceLabel: fileName,
+					sourcePath: dumped.filePath,
+					clientSourceId,
+				});
 				this.json(res, 200, {
 					ok: true,
 					path: dumped.notePath,
 					filePath: dumped.filePath,
 					organized: false,
+					clientSourceId,
 					warning: "无记录本：音频已进收件箱",
 				});
 			} catch (e) {
@@ -1174,6 +1186,10 @@ export class MobileBridgeServer {
 				path: dumped.notePath,
 				organized: false,
 				at: new Date().toISOString(),
+				kind: "file",
+				sourceLabel: fileName,
+				sourcePath: dumped.filePath,
+				clientSourceId,
 			});
 			this.json(res, 200, {
 				ok: true,
@@ -1181,6 +1197,7 @@ export class MobileBridgeServer {
 				filePath: dumped.filePath,
 				inboxOnly: true,
 				organized: false,
+				clientSourceId,
 			});
 			return;
 		}
@@ -1205,12 +1222,17 @@ const meta = await this.resolveStrictNotebook(notebookId);
 				path: dumped.notePath,
 				organized: false,
 				at: new Date().toISOString(),
+				kind: "file",
+				sourceLabel: fileName,
+				sourcePath: dumped.filePath,
+				clientSourceId,
 			});
 			this.json(res, 200, {
 				ok: true,
 				path: dumped.notePath,
 				filePath: dumped.filePath,
 				organized: false,
+				clientSourceId,
 				warning: "无记录本：文件已进收件箱，待选择记录本整理",
 			});
 			return;

@@ -23,6 +23,8 @@ export interface IVaultFs {
 	/** Binary files (audio, images). Optional for pure-text mocks. */
 	writeBinary?(path: string, data: ArrayBuffer): Promise<unknown>;
 	remove(path: string): Promise<void>;
+	/** Remove a folder tree only when it contains no files. */
+	removeEmptyFolder?(path: string): Promise<boolean>;
 	move(from: string, to: string): Promise<void>;
 	listFilesInFolder(folderPath: string): VaultFileRef[];
 	listImmediateFolders(folderPath: string): VaultFolderRef[];

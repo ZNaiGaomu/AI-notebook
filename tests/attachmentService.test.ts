@@ -144,12 +144,175 @@ describe("AttachmentService", () => {
 		);
 		expect(rewrites.length).toBeGreaterThan(0);
 		expect(rewrites[0]!.to).toContain("基础电化学-詹东平-改名");
+		expect(await vault.exists(rewrites[0]!.to)).toBe(true);
+		expect(await vault.exists(stored.vaultPath)).toBe(false);
 		const body = `pre
 ![[${stored.vaultPath}]]
 post`;
 		const next = attachments.rewriteEmbedPaths(body, rewrites);
 		expect(next).toContain(rewrites[0]!.to);
 		expect(next).not.toContain(stored.vaultPath);
+	});
+
+	it("does not rewrite missing managed sources during title sync", async () => {
+		const vault = new MemoryVault();
+		const settings = createDefaultSettings();
+		const versions = new VersionService(vault, () => settings);
+		const notebooks = new NotebookService(vault, versions, () => settings);
+		const items = new ItemService(vault, versions, () => settings);
+		const attachments = new AttachmentService(vault, () => settings);
+		const meta = await notebooks.createNotebook({
+			name: "空白本66",
+			templateId: "blank",
+		});
+		const item = await items.createItem(meta, { title: "66-66-66" });
+		const data = new TextEncoder().encode("voice").buffer;
+		const stored = await attachments.importBinary(meta, {
+			displayName: "voice.m4a",
+			data,
+			mime: "audio/mp4",
+			item_id: item.frontmatter.item_id,
+			itemName: "66-66-66",
+			kind: "voice",
+		});
+		expect(await vault.exists(stored.vaultPath)).toBe(true);
+		await vault.remove(stored.vaultPath);
+		expect(await vault.exists(stored.vaultPath)).toBe(false);
+
+		const rewrites = await attachments.syncItemTitle(
+			meta,
+			item.frontmatter.item_id,
+			"666",
+		);
+		expect(rewrites).toEqual([]);
+		const after = await attachments.findById(meta, stored.id);
+		expect(after?.vaultPath).toBe(stored.vaultPath);
+		expect(await vault.exists(stored.vaultPath.replace("/66-66-66/", "/666/"))).toBe(
+			false,
+		);
+	});
+
+	it("consolidates same-item historical labels without inventing -2", async () => {
+		const vault = new MemoryVault();
+		const settings = createDefaultSettings();
+		const versions = new VersionService(vault, () => settings);
+		const notebooks = new NotebookService(vault, versions, () => settings);
+		const items = new ItemService(vault, versions, () => settings);
+		const attachments = new AttachmentService(vault, () => settings);
+		const meta = await notebooks.createNotebook({
+			name: "空白本66",
+			templateId: "blank",
+		});
+		const item = await items.createItem(meta, { title: "66-66-66" });
+		const data = new TextEncoder().encode("voice").buffer;
+		const stored = await attachments.importBinary(meta, {
+			displayName: "voice.m4a",
+			data,
+			mime: "audio/mp4",
+			item_id: item.frontmatter.item_id,
+			itemName: "66-66-66",
+			kind: "voice",
+		});
+		// Stale empty folder left from a previous partial rename attempt.
+		await vault.ensureFolder(
+			stored.vaultPath
+				.replace("/66-66-66/", "/666/")
+				.slice(0, stored.vaultPath.replace("/66-66-66/", "/666/").lastIndexOf("/")),
+		);
+
+		const rewrites = await attachments.syncItemTitle(
+			meta,
+			item.frontmatter.item_id,
+			"666",
+		);
+		expect(rewrites).toHaveLength(1);
+		expect(rewrites[0]!.to).toContain("/items/666/");
+		expect(rewrites[0]!.to).not.toContain("/items/666-2/");
+		expect(await vault.exists(rewrites[0]!.to)).toBe(true);
+		const after = await attachments.findById(meta, stored.id);
+		expect(after?.vaultPath).toBe(rewrites[0]!.to);
+		const body = `%% ai-notebook-voice:start path="${encodeURIComponent(stored.vaultPath)}" %%\n![[${stored.vaultPath}]]`;
+		const rewritten = attachments.rewriteEmbedPaths(body, rewrites);
+		expect(rewritten).toContain(encodeURIComponent(rewrites[0]!.to));
+		expect(rewritten).toContain(`![[${rewrites[0]!.to}]]`);
+		const oldItemRoot = stored.vaultPath.slice(
+			0,
+			stored.vaultPath.indexOf("/voice/"),
+		);
+		expect(await vault.exists(oldItemRoot)).toBe(false);
+	});
+
+	it("keeps different-item collisions on a safe suffix", async () => {
+		const vault = new MemoryVault();
+		const settings = createDefaultSettings();
+		const versions = new VersionService(vault, () => settings);
+		const notebooks = new NotebookService(vault, versions, () => settings);
+		const items = new ItemService(vault, versions, () => settings);
+		const attachments = new AttachmentService(vault, () => settings);
+		const meta = await notebooks.createNotebook({
+			name: "空白本66",
+			templateId: "blank",
+		});
+		const itemA = await items.createItem(meta, { title: "66-66-66" });
+		const itemB = await items.createItem(meta, { title: "666" });
+		const data = new TextEncoder().encode("x").buffer;
+		const a = await attachments.importBinary(meta, {
+			displayName: "a.bin",
+			data,
+			item_id: itemA.frontmatter.item_id,
+			itemName: "66-66-66",
+		});
+		const b = await attachments.importBinary(meta, {
+			displayName: "b.bin",
+			data,
+			item_id: itemB.frontmatter.item_id,
+			itemName: "666",
+		});
+		expect(b.vaultPath).toContain("/items/666/");
+
+		const rewrites = await attachments.syncItemTitle(
+			meta,
+			itemA.frontmatter.item_id,
+			"666",
+		);
+		expect(rewrites).toHaveLength(1);
+		expect(rewrites[0]!.to).toContain("/items/666-2/");
+		const afterB = await attachments.findById(meta, b.id);
+		expect(afterB?.vaultPath).toBe(b.vaultPath);
+		expect(await vault.exists(a.vaultPath)).toBe(false);
+		expect(await vault.exists(rewrites[0]!.to)).toBe(true);
+	});
+
+	it("assignToItem refuses missing managed sources", async () => {
+		const vault = new MemoryVault();
+		const settings = createDefaultSettings();
+		const versions = new VersionService(vault, () => settings);
+		const notebooks = new NotebookService(vault, versions, () => settings);
+		const items = new ItemService(vault, versions, () => settings);
+		const attachments = new AttachmentService(vault, () => settings);
+		const meta = await notebooks.createNotebook({
+			name: "移",
+			templateId: "blank",
+		});
+		const data = new TextEncoder().encode("x").buffer;
+		const unlinked = await attachments.importBinary(meta, {
+			displayName: "a.bin",
+			data,
+			origin: "test",
+		});
+		await vault.remove(unlinked.vaultPath);
+		const item = await items.createItem(meta, { title: "目标" });
+		await expect(
+			attachments.assignToItem(
+				meta,
+				unlinked.id,
+				item.frontmatter.item_id,
+				item.frontmatter.title,
+			),
+		).rejects.toThrow(/不存在/);
+		const after = await attachments.findById(meta, unlinked.id);
+		expect(after?.vaultPath).toBe(unlinked.vaultPath);
+		expect(after?.item_id).toBeNull();
 	});
 
 });

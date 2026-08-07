@@ -1,13 +1,15 @@
-import type { AiNotebookSettings, NotebookMeta } from "../domain/types";
+import type { AiNotebookSettings, NotebookItem, NotebookMeta } from "../domain/types";
 import { createId, nowIso } from "../domain/ids";
 import {
 	attachmentsRoot,
 	cabinetDir,
 	joinPath,
 	notebooksRoot,
+	pathSegment,
 	structuredAttachmentsDir,
 } from "../infra/paths";
 import type { IVaultFs } from "../infra/vaultPort";
+import { itemDisplayName } from "./itemDisplayName";
 
 export type CabinetLink = {
 	id: string;
@@ -385,6 +387,70 @@ export class CabinetService {
 			physicalDeleted: true,
 			reason: "deleted",
 		};
+	}
+
+	/**
+	 * Move managed cabinet files into the stable filename-based item folder.
+	 * Mirrors AttachmentService.syncItemFolder for the independent cabinet index.
+	 */
+	async syncItemFolder(
+		meta: NotebookMeta,
+		item: NotebookItem,
+	): Promise<Array<{ from: string; to: string }>> {
+		const store = await this.readFiles(meta.folderName);
+		const itemId = item.frontmatter.item_id;
+		const nextLabel = pathSegment(itemDisplayName(item), "未命名条目");
+		const owned = store.items.filter(
+			(f) => f.item_id === itemId && f.ownership === "managed",
+		);
+		if (!owned.length) return [];
+
+		const rewrites: Array<{ from: string; to: string }> = [];
+		const nextItems = [...store.items];
+		for (const rec of owned) {
+			const destDir = structuredAttachmentsDir(
+				this.getSettings(),
+				meta.notebook_id,
+				meta.name,
+				itemId,
+				nextLabel,
+				rec.kind,
+			);
+			await this.vault.ensureFolder(destDir);
+			const baseName = sanitizeFileName(
+				rec.vaultPath.slice(rec.vaultPath.lastIndexOf("/") + 1) ||
+					rec.displayName,
+			);
+			const safeName = await uniqueFileName(baseName, async (name) =>
+				this.vault.exists(joinPath(destDir, name)),
+			);
+			const nextPath = joinPath(destDir, safeName);
+			if (sameVaultPath(rec.vaultPath, nextPath)) {
+				const idx = nextItems.findIndex((x) => x.id === rec.id);
+				if (idx >= 0 && rec.managedRoot !== destDir) {
+					nextItems[idx] = { ...rec, managedRoot: destDir };
+				}
+				continue;
+			}
+			if (!(await this.vault.exists(rec.vaultPath))) continue;
+			await this.vault.move(rec.vaultPath, nextPath);
+			if (!(await this.vault.exists(nextPath))) continue;
+			rewrites.push({ from: rec.vaultPath, to: nextPath });
+			const idx = nextItems.findIndex((x) => x.id === rec.id);
+			if (idx >= 0) {
+				nextItems[idx] = {
+					...rec,
+					vaultPath: nextPath,
+					managedRoot: destDir,
+				};
+			}
+		}
+		if (rewrites.length) {
+			await this.vault.writeJson(this.filesPath(meta.folderName), {
+				items: nextItems,
+			});
+		}
+		return rewrites;
 	}
 
 	async attachIfUrl(

@@ -23,11 +23,36 @@ Android 客户端：对齐电脑 Obsidian 插件「手机网页入口」的采�
 
 可复制到 `dist/` 方便保存。
 
+## 统一构建 Preview APK
+
+在仓库根目录执行：
+
+```bash
+npm run android:preview
+```
+
+该命令会清理旧构建、编译测试源码、执行 Android Lint、构建并验证测试签名 Preview，最后只把可安装/可上传的当前版本写到：
+
+```text
+release/app/dist/suji-vX.Y.Z-preview.apk
+release/app/dist/suji-vX.Y.Z-preview.apk.sha256
+```
+
+`app/build/outputs/` 只属于 Gradle 可再生中间产物，不要从那里上传 GitHub Release。构建失败时，脚本会保留 `dist` 中原有的已验证 APK；只有新 APK 的包名、版本和签名全部通过后才会替换。
+
+发布已有 Tag 时使用：
+
+```bash
+npm run android:publish -- vX.Y.Z
+```
+
+发布命令会先强制重新构建，再检查 Tag 是否指向当前 `HEAD`，随后替换 GitHub Release 中的 APK 和 SHA-256 文件，避免上传旧构建。
+
 ## GitHub Release 安装包
 
-第七版 Release 页面提供独立 Android 安装包：
+第八版 Release 页面提供独立 Android 安装包：
 
-`suji-v0.7.0-preview.apk`
+`suji-v0.8.0-preview.apk`
 
 这是使用 Android 测试密钥签名的可安装 Preview 构建，适合 Android 10+ 侧载体验。它不是正式生产签名包；未来切换到正式签名版本时，Android 可能要求先卸载 Preview，卸载会清除 App 本地队列和手机副本。安装包不会包含在 Git 源码提交中，源码工程仍保留在本目录。
 
@@ -48,7 +73,7 @@ Android 客户端：对齐电脑 Obsidian 插件「手机网页入口」的采�
 | 录入 | 记录本/条目选择与新建；文字；原生录音；文件；三按钮（待发送 / 立即发送并整理 / 仅收件箱） |
 | 待发送 | 本地队列、勾选发送、删到垃圾箱 |
 | 垃圾箱 | 30 天、恢复/永久删除/清空 |
-| 最近 | 电脑端最近写入刷新 |
+| 最近 | 记录本→条目→写入历史；打开文件；行内删除 |
 | 设置 | 粘贴链接、扫码、分栏主机端口令牌、语音 M4A/WAV、测试连接 |
 
 ## 命令行编译（可选）

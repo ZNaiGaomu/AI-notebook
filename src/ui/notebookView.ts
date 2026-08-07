@@ -179,7 +179,19 @@ export class NotebookView extends ItemView {
 					const rewrites = migrated.get(item.frontmatter.item_id);
 					if (!rewrites?.length) continue;
 					const body = this.plugin.attachments.rewriteEmbedPaths(item.body, rewrites);
-					if (body !== item.body) await this.plugin.items.updateItem(item, { body });
+					const currentAudioPath = String(item.frontmatter.audio_path ?? "");
+					const rewrittenAudioPath = rewrites.reduce(
+						(path, rewrite) => (path === rewrite.from ? rewrite.to : path),
+						currentAudioPath,
+					);
+					if (body !== item.body || rewrittenAudioPath !== currentAudioPath) {
+						await this.plugin.items.updateItem(item, {
+							body,
+							...(rewrittenAudioPath !== currentAudioPath
+								? { fields: { audio_path: rewrittenAudioPath } }
+								: {}),
+						});
+					}
 				}
 				this.items = await this.plugin.items.listItems(meta);
 			}
@@ -705,7 +717,11 @@ export class NotebookView extends ItemView {
 					pendingItem.frontmatter.title,
 				);
 				const previousVaultPath = vaultPath;
-				if (assigned.vaultPath !== vaultPath) {
+				// Only rewrite body/audio_path after the physical destination is confirmed.
+				if (
+					assigned.vaultPath !== vaultPath &&
+					(await this.app.vault.adapter.exists(assigned.vaultPath))
+				) {
 					vaultPath = assigned.vaultPath;
 					const { buildEmbedMarkdown } = await import(
 						"../services/voicePipeline"

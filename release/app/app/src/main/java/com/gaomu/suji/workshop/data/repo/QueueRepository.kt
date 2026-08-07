@@ -40,6 +40,8 @@ data class QueueItem(
     val originalUriPersisted: Boolean = false,
     val originalMimeType: String = "",
     val originalDisplayName: String = "",
+    /** Size of the original source at capture time; 0 means unknown/legacy. */
+    val originalSize: Long = 0L,
 )
 
 class QueueRepository(context: Context) {

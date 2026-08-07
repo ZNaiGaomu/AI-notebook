@@ -260,7 +260,49 @@ export const PLUGIN_CAPABILITY_LOG: PluginCapabilityEntry[] = [
 			],
 			releasedAt: "2026-08-05",
 			category: "inbox",
-		}
+		},
+		{
+			id: "cap-0.7.0-android-app",
+			pluginVersion: "0.7.0",
+			title: "原生 Android App 与稳定条目名",
+			summary: "Android 10+ 速记工坊；离线队列；条目显示名统一为 items 文件名",
+			details: [
+				"原生 App：文字 / 录音 / 文件、待发送、垃圾箱、扫码连接",
+				"手机来源双通道：App 私有副本 + 原始 content URI",
+				"列表与附件归属统一使用 items/*.md 文件名",
+				"语音重新转写使用 Obsidian 隐藏注释",
+			],
+			releasedAt: "2026-08-06",
+			category: "bridge",
+		},
+		{
+			id: "cap-0.8.0-item-folder-sync",
+			pluginVersion: "0.8.0",
+			title: "条目改名全量同步 + 语音 fail-closed",
+			summary: "改名同步附件/收藏柜/chat-uploads/残留目录；缺文件不写悬空嵌入",
+			details: [
+				"itemFolderSync：attachments + cabinet + chat-uploads + residual",
+				"同 item_id 历史目录收敛，避免 666-2 伪碰撞",
+				"语音/附件移动前校验物理文件存在",
+				"聊天历史 vaultPath 随 rewrites 更新",
+			],
+			releasedAt: "2026-08-07",
+			category: "core",
+		},
+		{
+			id: "cap-0.8.0-android-recent-nav",
+			pluginVersion: "0.8.0",
+			title: "Android 最近三层导航与严格打开",
+			summary: "记录本→条目→历史；行内删除；打开文件严格匹配来源",
+			details: [
+				"最近页：一行一记录本 / 一条目，右侧进入下一级",
+				"统一「打开文件」：本地副本优先，原 URI 需元数据校验",
+				"clientSourceId 精确匹配，禁止弱回退开错文件",
+				"删除移到记录行右侧，不碰电脑 vault",
+			],
+			releasedAt: "2026-08-07",
+			category: "ui",
+		},
 ];
 
 export function listPluginCapabilitiesNewestFirst(): PluginCapabilityEntry[] {

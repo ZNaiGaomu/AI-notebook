@@ -1,6 +1,7 @@
 package com.gaomu.suji.workshop.data.repo
 
 import android.content.Context
+import com.gaomu.suji.workshop.net.RecentDto
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -21,6 +22,8 @@ data class LocalRecentEntry(
     val originalUriPersisted: Boolean = false,
     val originalMimeType: String = "",
     val originalDisplayName: String = "",
+    /** Size of the original source at capture time; 0 means unknown/legacy. */
+    val originalSize: Long = 0L,
     val localCopyDeleted: Boolean = false,
     val destPath: String = "",
     val notebookName: String = "",
@@ -83,6 +86,12 @@ class LocalRecentStore(context: Context) {
             hiddenFile.writeText(json.encodeToString(next))
         }
 
+    suspend fun hideRows(rows: List<RecentDto>) =
+        withContext(Dispatchers.IO) {
+            val next = loadHiddenUnlocked() + rows.mapNotNull(::stableKey)
+            hiddenFile.writeText(json.encodeToString(next))
+        }
+
     suspend fun remove(ids: Set<String>) =
         withContext(Dispatchers.IO) {
             val next = loadUnlocked().filterNot { it.id in ids }
@@ -95,21 +104,19 @@ class LocalRecentStore(context: Context) {
         kind: String,
         preview: String,
         destPath: String,
-    ): LocalRecentEntry? {
-        if (clientSourceId.isNotBlank()) {
-            list.firstOrNull { it.clientSourceId == clientSourceId }?.let { return it }
-        }
-        return list.firstOrNull {
-            it.kind == kind &&
-                (it.preview == preview || it.title == preview) &&
-                (destPath.isBlank() || it.destPath == destPath)
-        } ?: list.firstOrNull { it.kind == kind && it.preview == preview }
-    }
+    ): LocalRecentEntry? = matchLocalRecentEntry(list, clientSourceId, kind, preview, destPath)
 
     private fun stableKey(entry: LocalRecentEntry): String? =
         when {
             entry.clientSourceId.isNotBlank() -> "client:${entry.clientSourceId}"
             entry.destPath.isNotBlank() -> "path:${entry.kind}:${entry.destPath}"
+            else -> null
+        }
+
+    private fun stableKey(row: RecentDto): String? =
+        when {
+            row.clientSourceId.isNotBlank() -> "client:${row.clientSourceId}"
+            row.path.isNotBlank() -> "path:${row.kind}:${row.path}"
             else -> null
         }
 
