@@ -270,36 +270,137 @@ function normalizeAppliedPackage(
 	};
 }
 
+function normalizeReleaseCacheEntry(
+	raw: unknown,
+): AiNotebookSettings["pluginHistory"]["sources"][number]["cachedReleases"][number] | null {
+	if (!raw || typeof raw !== "object") return null;
+	const x = raw as Record<string, unknown>;
+	const ch = x.fetchChannel;
+	const fetchChannel: "release" | "tags" | "code" | undefined =
+		ch === "release" || ch === "tags" || ch === "code" ? ch : undefined;
+	const version =
+		typeof x.version === "string" ? x.version.replace(/^v/i, "") : "";
+	const downloadUrl = typeof x.downloadUrl === "string" ? x.downloadUrl : "";
+	if (!version || !downloadUrl) return null;
+	return {
+		version,
+		tagName: typeof x.tagName === "string" ? x.tagName : "",
+		name: typeof x.name === "string" ? x.name : "",
+		publishedAt: typeof x.publishedAt === "string" ? x.publishedAt : "",
+		body: typeof x.body === "string" ? x.body : "",
+		downloadUrl,
+		htmlUrl: typeof x.htmlUrl === "string" ? x.htmlUrl : "",
+		fetchChannel,
+		fetchChannelLabel:
+			typeof x.fetchChannelLabel === "string"
+				? x.fetchChannelLabel
+				: undefined,
+	};
+}
+
 function normalizeVersionSource(
 	raw: unknown,
 ): AiNotebookSettings["pluginHistory"]["sources"][number] {
 	const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-	const releases = Array.isArray(o.cachedReleases)
+	const legacyMixed = Array.isArray(o.cachedReleases)
 		? o.cachedReleases
-				.filter((r) => r && typeof r === "object")
-				.map((r) => {
-					const x = r as Record<string, unknown>;
-					const ch = x.fetchChannel;
-					const fetchChannel: "release" | "tags" | "code" | undefined =
-						ch === "release" || ch === "tags" || ch === "code" ? ch : undefined;
-					return {
-						version:
-							typeof x.version === "string" ? x.version.replace(/^v/i, "") : "",
-						tagName: typeof x.tagName === "string" ? x.tagName : "",
-						name: typeof x.name === "string" ? x.name : "",
-						publishedAt: typeof x.publishedAt === "string" ? x.publishedAt : "",
-						body: typeof x.body === "string" ? x.body : "",
-						downloadUrl: typeof x.downloadUrl === "string" ? x.downloadUrl : "",
-						htmlUrl: typeof x.htmlUrl === "string" ? x.htmlUrl : "",
-						fetchChannel,
-						fetchChannelLabel:
-							typeof x.fetchChannelLabel === "string"
-								? x.fetchChannelLabel
-								: undefined,
-					};
-				})
-				.filter((r) => r.version && r.downloadUrl)
+				.map((r) => normalizeReleaseCacheEntry(r))
+				.filter(
+					(
+						r,
+					): r is AiNotebookSettings["pluginHistory"]["sources"][number]["cachedReleases"][number] =>
+						Boolean(r),
+				)
 		: [];
+	const explicitTags = Array.isArray(o.cachedTags)
+		? o.cachedTags
+				.map((r) => normalizeReleaseCacheEntry(r))
+				.filter(
+					(
+						r,
+					): r is AiNotebookSettings["pluginHistory"]["sources"][number]["cachedTags"][number] =>
+						Boolean(r),
+				)
+		: [];
+
+	// Migrate pre-split caches: old cachedReleases may mix release + tags.
+	const hasExplicitTagsField = Array.isArray(o.cachedTags);
+	let cachedReleases = legacyMixed;
+	let cachedTags = explicitTags;
+	if (!hasExplicitTagsField && legacyMixed.length > 0) {
+		cachedReleases = legacyMixed.filter(
+			(r) => r.fetchChannel === "release" || !r.fetchChannel,
+		);
+		const fromLegacyTags = legacyMixed.filter(
+			(r) => r.fetchChannel === "tags" || r.fetchChannel === "code",
+		);
+		// If everything was tags-channel (common when API failed), keep them in tags only.
+		if (
+			cachedReleases.length === legacyMixed.length &&
+			legacyMixed.every((r) => r.fetchChannel === "tags" || r.fetchChannel === "code")
+		) {
+			cachedReleases = [];
+			cachedTags = legacyMixed.map((r) => ({
+				...r,
+				fetchChannel: "tags" as const,
+				fetchChannelLabel: r.fetchChannelLabel || "Tags 源码包",
+			}));
+		} else if (fromLegacyTags.length > 0) {
+			cachedTags = fromLegacyTags.map((r) => ({
+				...r,
+				fetchChannel: (r.fetchChannel === "code" ? "code" : "tags") as
+					| "tags"
+					| "code",
+				fetchChannelLabel:
+					r.fetchChannelLabel ||
+					(r.fetchChannel === "code" ? "Code Download ZIP" : "Tags 源码包"),
+			}));
+			cachedReleases = legacyMixed
+				.filter((r) => r.fetchChannel === "release")
+				.map((r) => ({
+					...r,
+					fetchChannel: "release" as const,
+					fetchChannelLabel: r.fetchChannelLabel || "Release 附件",
+				}));
+		} else {
+			// Unknown channel → treat as release only if URL looks like release asset, else tags
+			cachedReleases = [];
+			cachedTags = [];
+			for (const r of legacyMixed) {
+				const isAsset =
+					/github\.com\/[^/]+\/[^/]+\/releases\/download\//i.test(
+						r.downloadUrl,
+					) || r.fetchChannel === "release";
+				if (isAsset) {
+					cachedReleases.push({
+						...r,
+						fetchChannel: "release",
+						fetchChannelLabel: r.fetchChannelLabel || "Release 附件",
+					});
+				} else {
+					cachedTags.push({
+						...r,
+						fetchChannel: "tags",
+						fetchChannelLabel: r.fetchChannelLabel || "Tags 源码包",
+					});
+				}
+			}
+		}
+	}
+
+	const lastFetchedReleaseAt =
+		typeof o.lastFetchedReleaseAt === "string" || o.lastFetchedReleaseAt === null
+			? (o.lastFetchedReleaseAt as string | null)
+			: null;
+	const lastFetchedTagsAt =
+		typeof o.lastFetchedTagsAt === "string" || o.lastFetchedTagsAt === null
+			? (o.lastFetchedTagsAt as string | null)
+			: null;
+	const lastFetchedAt =
+		typeof o.lastFetchedAt === "string" || o.lastFetchedAt === null
+			? (o.lastFetchedAt as string | null)
+			: null;
+
 	return {
 		id: typeof o.id === "string" ? o.id : "",
 		name: typeof o.name === "string" ? o.name : "未命名来源",
@@ -307,10 +408,14 @@ function normalizeVersionSource(
 		owner: typeof o.owner === "string" ? o.owner : "",
 		repo: typeof o.repo === "string" ? o.repo : "",
 		lastFetchedAt:
-			typeof o.lastFetchedAt === "string" || o.lastFetchedAt === null
-				? (o.lastFetchedAt as string | null)
-				: null,
-		cachedReleases: releases,
+			lastFetchedAt ??
+			lastFetchedReleaseAt ??
+			lastFetchedTagsAt ??
+			null,
+		lastFetchedReleaseAt,
+		lastFetchedTagsAt,
+		cachedReleases,
+		cachedTags,
 	};
 }
 

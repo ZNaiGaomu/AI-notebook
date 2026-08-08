@@ -259,6 +259,9 @@ export type PluginReleaseCacheEntry = {
 	fetchChannelLabel?: string;
 };
 
+/** Which remote list the user is browsing inside a source. */
+export type PluginSourceChannel = "release" | "tags";
+
 /** User-configured package source (one row, like an AI provider). */
 export type PluginVersionSource = {
 	id: string;
@@ -268,9 +271,25 @@ export type PluginVersionSource = {
 	repoUrl: string;
 	owner: string;
 	repo: string;
+	/**
+	 * Last successful fetch of either channel (UI summary).
+	 * Prefer lastFetchedReleaseAt / lastFetchedTagsAt for per-list status.
+	 */
 	lastFetchedAt: string | null;
-	/** Last successfully fetched release list (does not affect running package) */
+	/** Last successful Release-附件 list fetch */
+	lastFetchedReleaseAt?: string | null;
+	/** Last successful Tags 源码包 list fetch */
+	lastFetchedTagsAt?: string | null;
+	/**
+	 * Release 安装包列表 only（GitHub Release 附件 zip）.
+	 * Independent from cachedTags — never mixed in UI.
+	 */
 	cachedReleases: PluginReleaseCacheEntry[];
+	/**
+	 * Tags 源码包列表 only（tag / 源码 zip）.
+	 * Independent from cachedReleases — never mixed in UI.
+	 */
+	cachedTags: PluginReleaseCacheEntry[];
 };
 
 export type AiNotebookSettings = {

@@ -2,13 +2,9 @@
  * Fetch installable plugin packages from a GitHub repo (on-demand only).
  * Never mutates the running package — callers download / switch explicitly.
  *
- * Always merge (do not stop at first hit):
- * 1) GitHub Tags HTML page (zip buttons — works without API token)
- * 2) jsDelivr tag list
- * 3) GitHub Releases API (zip assets when any)
- * 4) GitHub Tags API
- * 5) Code → Download ZIP (default branch latest)
- * Download prefers github.com/archive/...zip (same as Tags page).
+ * UI keeps two independent channels (do not mix in one list):
+ * - fetchGithubReleaseChannel / channel "release": GitHub Release zip assets only
+ * - fetchGithubTagsChannel / channel "tags": Tags HTML → jsDelivr → Tags API → branch zip
  */
 
 import { requestUrl } from "obsidian";
@@ -102,6 +98,23 @@ type GhTag = {
 function stripV(tag: string): string {
 	return tag.replace(/^v/i, "").trim();
 }
+
+
+/** Browser page for a git tag (Tags tab / tree) — NOT the Release notes page. */
+export function githubTagBrowseUrl(
+	owner: string,
+	repo: string,
+	tag: string,
+): string {
+	const t = (tag || "").trim() || "main";
+	// tree/<tag> shows the source at that tag; /tags is the Tags list tab.
+	return `https://github.com/${owner}/${repo}/tree/${encodeURIComponent(t)}`;
+}
+
+export function githubTagsListUrl(owner: string, repo: string): string {
+	return `https://github.com/${owner}/${repo}/tags`;
+}
+
 
 function pickZipAsset(assets: GhAsset[] | undefined): GhAsset | null {
 	if (!assets?.length) return null;
@@ -347,7 +360,9 @@ async function fromTagsApi(
 			publishedAt: "",
 			body: "来源：GitHub Tags API（源码 zip；安装时提取 release/ai-notebook 或根目录三文件）",
 			downloadUrl: githubTagZipUrl(owner, repo, tag),
-			htmlUrl: `https://github.com/${owner}/${repo}/releases/tag/${encodeURIComponent(tag)}`,
+			htmlUrl: githubTagBrowseUrl(owner, repo, tag),
+			fetchChannel: "tags",
+			fetchChannelLabel: "Tags 源码包",
 		});
 	}
 	trace.push(`Tags API：${out.length} 条`);
@@ -405,7 +420,7 @@ async function fromJsDelivr(
 			publishedAt: "",
 			body: "来源：jsDelivr 标签列表 · 下载 = GitHub Tags 源码 zip（内含 release/ai-notebook）",
 			downloadUrl: githubTagZipUrl(owner, repo, tagName),
-			htmlUrl: `https://github.com/${owner}/${repo}/releases/tag/${encodeURIComponent(tagName)}`,
+			htmlUrl: githubTagBrowseUrl(owner, repo, tagName),
 			fetchChannel: "tags",
 			fetchChannelLabel: "Tags 源码包",
 		});
@@ -467,7 +482,7 @@ async function fromTagsHtml(
 			publishedAt: "",
 			body: "Tags 页面 zip（与网页按钮相同）",
 			downloadUrl: githubTagZipUrl(owner, repo, tag),
-			htmlUrl: `https://github.com/${owner}/${repo}/releases/tag/${encodeURIComponent(tag)}`,
+			htmlUrl: githubTagBrowseUrl(owner, repo, tag),
 			fetchChannel: "tags",
 			fetchChannelLabel: "Tags 源码包",
 		});
@@ -534,28 +549,246 @@ async function fromDefaultBranch(
 	];
 }
 
+export type FetchChannel = "release" | "tags";
+
 /**
- * List installable packages with multi-source fallback.
- * Does not download zips; only builds a catalog with download URLs.
+ * Parse public Releases HTML for installable zip attachments (no API).
+ * Looks for /releases/download/.../*.zip — prefers ai-notebook / plugin names.
  */
-export async function fetchGithubReleases(
+async function fromReleasesHtml(
+	owner: string,
+	repo: string,
+	trace: string[],
+): Promise<PluginReleaseCacheEntry[]> {
+	const url = `https://github.com/${owner}/${repo}/releases`;
+	const res = await httpGet(url, {
+		Accept: "text/html",
+		"User-Agent":
+			"Mozilla/5.0 (compatible; ai-notebook-obsidian-plugin; +https://github.com/ZNaiGaomu/AI-notebook)",
+	});
+	if (!res.ok) {
+		trace.push(`Releases HTML 失败: ${res.error}`);
+		return [];
+	}
+	const html = res.text || "";
+	if (html.length < 200) {
+		trace.push("Releases HTML：内容过短或被拦截");
+		return [];
+	}
+
+	// href=".../releases/download/v0.8.0/ai-notebook-v0.8.0.zip"
+	const re =
+		/\/([^\/"'+\s]+)\/([^\/"'+\s]+)\/releases\/download\/([^\/"'?\s]+)\/([^"'?\s]+\.zip)/gi;
+	type Cand = { tag: string; file: string; url: string; score: number };
+	const byVer = new Map<string, Cand>();
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(html))) {
+		const o = m[1]!;
+		const r = m[2]!;
+		if (o.toLowerCase() !== owner.toLowerCase()) continue;
+		if (r.toLowerCase() !== repo.toLowerCase()) continue;
+		const tag = decodeURIComponent(m[3]!).replace(/\/$/, "").trim();
+		const file = decodeURIComponent(m[4]!).trim();
+		if (!tag || !file) continue;
+		const version = stripV(tag);
+		if (!version) continue;
+		let score = 0;
+		if (/ai-notebook/i.test(file)) score += 50;
+		if (/plugin/i.test(file)) score += 20;
+		if (/\.sha256$/i.test(file) || /\.apk$/i.test(file)) continue;
+		const full = `https://github.com/${owner}/${repo}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(file)}`;
+		const prev = byVer.get(version);
+		if (!prev || score > prev.score) {
+			byVer.set(version, { tag, file, url: full, score });
+		}
+	}
+
+	// Also catch expanded asset URLs without full owner path sometimes
+	const re2 =
+		/href="(https:\/\/github\.com\/[^"]+\/releases\/download\/[^"]+\.zip)"/gi;
+	while ((m = re2.exec(html))) {
+		const full = m[1]!;
+		const mm = full.match(
+			/github\.com\/([^\/]+)\/([^\/]+)\/releases\/download\/([^\/]+)\/([^\/?\s]+\.zip)/i,
+		);
+		if (!mm) continue;
+		if (mm[1]!.toLowerCase() !== owner.toLowerCase()) continue;
+		if (mm[2]!.toLowerCase() !== repo.toLowerCase()) continue;
+		const tag = decodeURIComponent(mm[3]!);
+		const file = decodeURIComponent(mm[4]!);
+		const version = stripV(tag);
+		if (!version) continue;
+		if (/\.sha256$/i.test(file) || /\.apk$/i.test(file)) continue;
+		let score = 0;
+		if (/ai-notebook/i.test(file)) score += 50;
+		if (/plugin/i.test(file)) score += 20;
+		const prev = byVer.get(version);
+		if (!prev || score > prev.score) {
+			byVer.set(version, { tag, file, url: full, score });
+		}
+	}
+
+	const out: PluginReleaseCacheEntry[] = [];
+	for (const [version, c] of byVer) {
+		out.push({
+			version,
+			tagName: c.tag.startsWith("v") ? c.tag : `v${version}`,
+			name: c.file.replace(/\.zip$/i, ""),
+			publishedAt: "",
+			body: `Releases 网页解析的安装包附件：${c.file}`,
+			downloadUrl: c.url,
+			htmlUrl: `https://github.com/${owner}/${repo}/releases/tag/${encodeURIComponent(c.tag)}`,
+			fetchChannel: "release",
+			fetchChannelLabel: "Release 附件",
+		});
+	}
+	out.sort((a, b) =>
+		b.version.localeCompare(a.version, undefined, { numeric: true }),
+	);
+	trace.push(
+		`Releases HTML：${out.length} 条（${out.map((x) => x.tagName).join(", ") || "无"}）`,
+	);
+	return out;
+}
+
+/**
+ * When API/HTML fail: discover tags, then HEAD/probe known plugin zip asset names.
+ * Does not mix Tags 源码包 — only real release asset URLs that respond OK.
+ */
+async function fromReleaseAssetProbe(
+	owner: string,
+	repo: string,
+	trace: string[],
+): Promise<PluginReleaseCacheEntry[]> {
+	// Reuse tag names from light sources (jsDelivr / tags HTML) as version candidates
+	const tagMap = new Map<string, PluginReleaseCacheEntry>();
+	mergeEntries(tagMap, await fromJsDelivr(owner, repo, trace));
+	if (tagMap.size === 0) {
+		mergeEntries(tagMap, await fromTagsHtml(owner, repo, trace));
+	}
+	const tags = [...tagMap.values()]
+		.map((e) => e.tagName || `v${e.version}`)
+		.filter(Boolean)
+		// newest-first already from sortReleases-ish map order is insertion; re-sort
+		.sort((a, b) =>
+			stripV(b).localeCompare(stripV(a), undefined, { numeric: true }),
+		)
+		.slice(0, 12);
+	if (!tags.length) {
+		trace.push("Release 附件探测：无可用 tag 候选");
+		return [];
+	}
+
+	const out: PluginReleaseCacheEntry[] = [];
+	for (const tag of tags) {
+		const version = stripV(tag);
+		if (!version) continue;
+		// Prefer the exact packaging name used by this project first.
+		const names = [
+			`ai-notebook-v${version}.zip`,
+			`ai-notebook-${version}.zip`,
+		];
+		const altTag = tag.startsWith("v") || tag.startsWith("V") ? tag : `v${version}`;
+		let found: string | null = null;
+		let foundName = "";
+		for (const name of names) {
+			for (const t of [...new Set([altTag, tag])]) {
+				const assetUrl = `https://github.com/${owner}/${repo}/releases/download/${encodeURIComponent(t)}/${encodeURIComponent(name)}`;
+				if (await probeReleaseAssetExists(assetUrl)) {
+					found = assetUrl;
+					foundName = name;
+					break;
+				}
+			}
+			if (found) break;
+		}
+		if (!found) continue;
+		out.push({
+			version,
+			tagName: altTag,
+			name: foundName.replace(/\.zip$/i, ""),
+			publishedAt: "",
+			body: `探测到 Release 安装包附件：${foundName}（API/网页列表不可用时的兜底）`,
+			downloadUrl: found,
+			htmlUrl: `https://github.com/${owner}/${repo}/releases/tag/${encodeURIComponent(altTag)}`,
+			fetchChannel: "release",
+			fetchChannelLabel: "Release 附件",
+		});
+	}
+	trace.push(
+		`Release 附件探测：${out.length} 条（${out.map((x) => x.tagName).join(", ") || "无"}）`,
+	);
+	return out;
+}
+
+/** True if a release asset URL looks reachable (not 404). */
+async function probeReleaseAssetExists(url: string): Promise<boolean> {
+	const attempts: Array<Record<string, string>> = [
+		{
+			"User-Agent": "ai-notebook-obsidian-plugin",
+			Range: "bytes=0-0",
+		},
+		{
+			"User-Agent": "ai-notebook-obsidian-plugin",
+		},
+	];
+	for (const headers of attempts) {
+		try {
+			const res = await requestUrl({
+				url,
+				method: "GET",
+				headers,
+				throw: false,
+			});
+			// 200/206 = ok; 301/302 rarely returned after follow; 403 may be API-ish but asset CDN often 200
+			if (res.status === 200 || res.status === 206) return true;
+			if (res.status === 404 || res.status === 410) return false;
+		} catch {
+			// try next header set
+		}
+	}
+	return false;
+}
+
+/**
+ * Fetch only GitHub Release 附件安装包列表（不混 Tags）。
+ * Order: Releases API → Releases HTML → 按 tag 探测 ai-notebook-*.zip。
+ * Empty list is ok:true with releases=[] so UI can show「暂无 Release 附件」.
+ */
+export async function fetchGithubReleaseChannel(
 	owner: string,
 	repo: string,
 ): Promise<FetchPackagesResult> {
 	const trace: string[] = [];
-
-	// Priority chain (first non-empty channel wins — do NOT mix):
-	// 1) Release 安装包附件
-	// 2) Tags 源码 zip
-	// 3) Code → Download ZIP（默认分支最新）
-
-	const releaseItems = await fromReleasesApi(owner, repo, trace);
-	if (releaseItems.length > 0) {
-		const releases = sortReleases(releaseItems);
-		trace.push(`采用通道：Release 附件（${releases.length}）`);
-		return { ok: true, releases, trace };
+	let releaseItems = await fromReleasesApi(owner, repo, trace);
+	if (releaseItems.length === 0) {
+		releaseItems = await fromReleasesHtml(owner, repo, trace);
 	}
+	if (releaseItems.length === 0) {
+		releaseItems = await fromReleaseAssetProbe(owner, repo, trace);
+	}
+	const releases = sortReleases(releaseItems);
+	if (releases.length === 0) {
+		trace.push("Release 通道：无带 zip 附件的 Release（API / 网页 / 附件探测均未找到）");
+		return {
+			ok: true,
+			releases: [],
+			trace,
+		};
+	}
+	trace.push(`Release 通道：${releases.length} 个安装包`);
+	return { ok: true, releases, trace };
+}
 
+/**
+ * Fetch only Tags 源码包列表（不混 Release 附件）。
+ * Fallback order inside tags: HTML → jsDelivr → Tags API → default branch snapshot.
+ */
+export async function fetchGithubTagsChannel(
+	owner: string,
+	repo: string,
+): Promise<FetchPackagesResult> {
+	const trace: string[] = [];
 	const tagMap = new Map<string, PluginReleaseCacheEntry>();
 	mergeEntries(tagMap, await fromTagsHtml(owner, repo, trace));
 	if (tagMap.size === 0) {
@@ -565,13 +798,15 @@ export async function fetchGithubReleases(
 		mergeEntries(tagMap, await fromTagsApi(owner, repo, trace));
 	}
 	for (const e of tagMap.values()) {
-		e.fetchChannel = e.fetchChannel ?? "tags";
+		e.fetchChannel = "tags";
 		e.fetchChannelLabel = e.fetchChannelLabel ?? "Tags 源码包";
+		// Always open the tag tree page, never the Release notes page.
+		e.htmlUrl = githubTagBrowseUrl(owner, repo, e.tagName || e.version);
 	}
 	if (tagMap.size > 0) {
 		const releases = sortReleases([...tagMap.values()]);
 		trace.push(
-			`采用通道：Tags（${releases.length}：${releases.map((r) => r.tagName || r.version).join(", ")}）`,
+			`Tags 通道：${releases.length} 个（${releases.map((r) => r.tagName || r.version).join(", ")}）`,
 		);
 		return { ok: true, releases, trace };
 	}
@@ -582,17 +817,60 @@ export async function fetchGithubReleases(
 		e.fetchChannelLabel = "Code Download ZIP";
 	}
 	if (codeItems.length > 0) {
-		trace.push(`采用通道：Code Download ZIP（${codeItems.length}）`);
+		trace.push(`Tags 通道兜底：Code Download ZIP（${codeItems.length}）`);
 		return { ok: true, releases: codeItems, trace };
 	}
 
 	return {
 		ok: false,
 		error:
-			`未能从 ${owner}/${repo} 获取任何可安装版本。\n` +
-			`已按优先级尝试：① Release 附件 → ② Tags 源码包 → ③ Code Download ZIP。\n` +
+			`未能从 ${owner}/${repo} 获取 Tags / 源码包版本。\n` +
 			trace.join(" · "),
 		trace,
+	};
+}
+
+/**
+ * Fetch one channel only. UI keeps Release / Tags as separate lists.
+ */
+export async function fetchGithubChannel(
+	owner: string,
+	repo: string,
+	channel: FetchChannel,
+): Promise<FetchPackagesResult> {
+	if (channel === "release") {
+		return fetchGithubReleaseChannel(owner, repo);
+	}
+	return fetchGithubTagsChannel(owner, repo);
+}
+
+/**
+ * @deprecated Prefer fetchGithubChannel / fetchGithubReleaseChannel / fetchGithubTagsChannel.
+ * Kept for older call sites: fetches Tags channel only was the previous fallback-heavy path;
+ * now explicitly fetches release first then tags is wrong for split UI — callers must choose.
+ * This legacy helper fetches **both** independently and returns release if any, else tags
+ * (same as old exclusive behavior) so accidental callers don't break hard.
+ */
+export async function fetchGithubReleases(
+	owner: string,
+	repo: string,
+): Promise<FetchPackagesResult> {
+	const rel = await fetchGithubReleaseChannel(owner, repo);
+	if (rel.ok && rel.releases.length > 0) return rel;
+	const tags = await fetchGithubTagsChannel(owner, repo);
+	if (tags.ok) {
+		return {
+			...tags,
+			trace: [...(rel.ok ? rel.trace : []), ...tags.trace],
+		};
+	}
+	return {
+		ok: false,
+		error:
+			`未能从 ${owner}/${repo} 获取任何可安装版本。\n` +
+			`请分别拉取「Release 安装包」与「Tags 源码包」。\n` +
+			[...(rel.ok ? rel.trace : [rel.error]), ...tags.trace].join(" · "),
+		trace: [...(rel.ok ? rel.trace : []), ...tags.trace],
 	};
 }
 

@@ -303,6 +303,20 @@ export const PLUGIN_CAPABILITY_LOG: PluginCapabilityEntry[] = [
 			releasedAt: "2026-08-07",
 			category: "ui",
 		},
+		{
+			id: "cap-0.8.1-plugin-history-channels",
+			pluginVersion: "0.8.1",
+			title: "插件整体历史：分通道拉取与安全切换",
+			summary: "Release/Tags 分列表；Release 兜底拉安装包；Tags 打开真标签页；切换前强制本地备份",
+			details: [
+				"每个 GitHub 来源内 Release 安装包与 Tags 源码包分开拉取、分开列表",
+				"Release：API → 网页解析 → ai-notebook-*.zip 附件探测（缓解 403 拉不到包）",
+				"Tags「打开标签页」指向 tree/tag，不再误开 releases/tag 发布页",
+				"本机版本只认已加载 manifest；切换前备份失败则中止，可回本地运行备份",
+			],
+			releasedAt: "2026-08-08",
+			category: "history",
+		},
 ];
 
 export function listPluginCapabilitiesNewestFirst(): PluginCapabilityEntry[] {

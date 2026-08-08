@@ -561,13 +561,44 @@ export class PluginPackageArchive {
 			};
 		}
 
-		// safety: archive current first so user can switch back
-		await this.archiveCurrentPackage();
+		// Must have the two required runtime files before touching the running package.
+		const srcMain = normalizePath(`${srcDir}/main.js`);
+		const srcManifest = normalizePath(`${srcDir}/manifest.json`);
+		if (!(await this.pathExists(srcMain)) || !(await this.pathExists(srcManifest))) {
+			return {
+				ok: false,
+				error: `存档不完整（缺少 main.js 或 manifest.json）：${srcDir}`,
+			};
+		}
 
-		for (const file of RUNTIME_FILES) {
-			const src = normalizePath(`${srcDir}/${file}`);
-			if (!(await this.pathExists(src))) continue;
-			await this.copyFile(src, `${dir}/${file}`);
+		// safety: archive current first so user can switch back.
+		// Backup failure aborts the switch — never leave the user without a local rollback.
+		const backup = await this.archiveCurrentPackage();
+		if (!backup.ok) {
+			return {
+				ok: false,
+				error: `切换前备份当前版本失败，已中止切换。${backup.error}。可先点「立即备份当前安装包到本地存档」再重试。`,
+			};
+		}
+
+		try {
+			for (const file of RUNTIME_FILES) {
+				const src = normalizePath(`${srcDir}/${file}`);
+				if (!(await this.pathExists(src))) {
+					// styles.css is optional; main/manifest already validated
+					if (file === "styles.css") continue;
+					throw new Error(`源存档缺少 ${file}`);
+				}
+				await this.copyFile(src, `${dir}/${file}`);
+			}
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			return {
+				ok: false,
+				error:
+					`切换写入失败：${msg}。当前运行包可能未完整更新。` +
+					`请到「本地运行备份」切换回 v${backup.version}（路径 ${backup.path}）。`,
+			};
 		}
 
 		const label = opts?.sourceName
@@ -581,6 +612,7 @@ export class PluginPackageArchive {
 				`sourceName: ${opts?.sourceName ?? "本地存档"}`,
 				`from: ${srcDir}`,
 				`label: ${label}`,
+				`preSwitchBackup: v${backup.version} @ ${backup.path}`,
 				`at: ${new Date().toISOString()}`,
 				`note: Reload Obsidian or disable/enable the plugin to load new main.js`,
 				`data.json was not modified`,

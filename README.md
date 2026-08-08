@@ -6,13 +6,13 @@
 
 | | |
 |---|---|
-| **当前版本** | `0.8.0`（第八版） |
+| **当前版本** | `0.8.1`（第八版.1） |
 | **插件 ID** | `ai-notebook` |
 | **仓库** | [ZNaiGaomu/AI-notebook](https://github.com/ZNaiGaomu/AI-notebook) |
 | **最低 Obsidian** | `1.5.0` |
-| **Android** | 10+（API 29），Preview APK |
+| **Android** | 10+（API 29），Preview APK（与 v0.8.0 同包，见 Release） |
 | **规格** | [`docs/V1-蓝图定稿.md`](docs/V1-蓝图定稿.md) |
-| **本版说明** | [`docs/RELEASE-v0.8.0.md`](docs/RELEASE-v0.8.0.md) |
+| **本版说明** | [`docs/RELEASE-v0.8.1.md`](docs/RELEASE-v0.8.1.md)（小更新；功能主线仍见 [`docs/RELEASE-v0.8.0.md`](docs/RELEASE-v0.8.0.md)） |
 
 开源后欢迎继续开发，把新版本传到自己的 GitHub；他人可通过仓库地址在插件内一键导入 / 切换安装包。  
 **QQ 群：1084160459** — 欢迎加入。
@@ -32,14 +32,14 @@
 
 | 来源 | 做法 |
 |------|------|
-| **推荐** | [Releases](https://github.com/ZNaiGaomu/AI-notebook/releases/latest) 下载 `ai-notebook-v0.8.0.zip`，解压即上述三文件 |
+| **推荐** | [Releases](https://github.com/ZNaiGaomu/AI-notebook/releases/latest) 下载 `ai-notebook-v0.8.1.zip`，解压即上述三文件 |
 | 仓库内 | 只用 [`release/ai-notebook/`](release/ai-notebook/) |
 | Tag 源码包 | 解压后**只进入**其中的 `release/ai-notebook/`，不要把整个源码目录当插件 |
 
 启用：设置 → 社区插件 → 关闭受限模式 → 启用 **AI 记录本**。  
 更新：只覆盖这三文件，**保留**同目录 `data.json`（你的 Key 与设置）。
 
-**Android：** 同一 Release 页下载 `suji-v0.8.0-preview.apk` 侧载。电脑插件启动手机入口 → App 设置里粘贴含 `?t=` 的链接或扫码 → 测试连接。
+**Android：** 从 [Releases](https://github.com/ZNaiGaomu/AI-notebook/releases) 下载 Preview APK 侧载（0.8.1 与 0.8.0 同包时见 v0.8.0 附件）。电脑插件启动手机入口 → App 设置里粘贴含 `?t=` 的链接或扫码 → 测试连接。
 
 > Preview 为测试签名。将来若换正式签名，系统可能要求先卸载 Preview（会清空 App 本地队列与手机副本，请先发完或备份）。
 
@@ -293,6 +293,7 @@ Android 工程也可用 Android Studio 打开 `release/app/`。单元测试若�
 | 版本 | 增量一句话 |
 |------|------------|
 | **0.8.0** | 改名全量同步（附件/柜/chat-uploads/残留）；语音 fail-closed；Android 最近三层导航 + 严格打开文件 + 行内删除 |
+| **0.8.1** | 插件整体历史：Release/Tags 分列表；Release 拉取兜底；Tags 打开真标签页；切换前强制备份 |
 | **0.7.0** | 原生 Android App；稳定条目标签；来源双通道；队列与最近清理保护 |
 | **0.6.0** | 独立附件体系；收件箱跨本整理与媒体预览 |
 | **0.5.0** | 手机定向追加已有条目；手机新建本/命名条目 |

@@ -1,7 +1,7 @@
 {
 	"id": "ai-notebook",
 	"name": "AI 记录本",
-	"version": "0.8.0",
+	"version": "0.8.1",
 	"minAppVersion": "1.5.0",
 	"description": "多实例 AI 记录本：蓝图驱动、附件/条目改名全量同步、浮层助手与语音、Android 定向写入与最近三层导航。",
 	"author": "zn217",

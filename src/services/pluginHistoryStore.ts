@@ -124,7 +124,7 @@ export function syncPluginHistoryOnLoad(
 					id: createId(),
 					at: nowIso(),
 					kind: "seen",
-					text: `首次同步插件能力时间线（当前包 ${latest.pluginVersion}）`,
+					text: `首次同步插件能力说明（能力日志版本 ${latest.pluginVersion}；不等于本机正在运行的安装包）`,
 					relatedCapabilityId: latest.id,
 					relatedPluginVersion: latest.pluginVersion,
 				},
@@ -173,7 +173,7 @@ export function recordRollbackIntent(
 		id: createId(),
 		at: nowIso(),
 		kind: "rollback-intent",
-		text: `计划将插件包回退到 ${targetVersion}（需手动替换 release 文件夹；笔记数据不受影响）`,
+		text: `已切换安装包到 v${targetVersion}（请禁用再启用本插件或重启 Obsidian 后生效；笔记数据不受影响；可在「本地运行备份」切回上一版）`,
 		relatedPluginVersion: targetVersion,
 		relatedCapabilityId: capabilityId,
 	};

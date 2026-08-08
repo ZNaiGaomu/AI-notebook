@@ -4,6 +4,7 @@ import type {
 	BlueprintVersionMeta,
 	NotebookMeta,
 	PluginReleaseCacheEntry,
+	PluginSourceChannel,
 	PluginVersionSource,
 } from "../domain/types";
 import type AiNotebookPlugin from "../main";
@@ -15,7 +16,8 @@ import {
 	recordRollbackIntent,
 } from "../services/pluginHistoryStore";
 import {
-	fetchGithubReleases,
+	fetchGithubChannel,
+	githubTagBrowseUrl,
 	parseGithubRepoUrl,
 	summarizeReleaseBody,
 } from "../services/githubReleaseService";
@@ -32,7 +34,7 @@ type HistoryTab = "notebook" | "plugin";
 /**
  * Dual-track history:
  * - 本内：当前记录本的蓝图功能版本（可真正 restore 配置）
- * - 插件：多来源 GitHub 安装包（按需拉取；显式切换；不改笔记）
+ * - 插件：多来源 GitHub 安装包；每个来源内 Release / Tags 分列表独立拉取
  */
 export class VersionHistoryModal extends Modal {
 	private plugin: AiNotebookPlugin;
@@ -41,8 +43,10 @@ export class VersionHistoryModal extends Modal {
 	private onRestored: () => void;
 	private tab: HistoryTab = "notebook";
 	private detailsCache = new Map<number, string[]>();
-	/** When set, plugin track shows this source's release list. */
+	/** When set, plugin track shows this source (hub or a channel list). */
 	private openSourceId: string | null = null;
+	/** null = source hub (two channel entries); release | tags = that list only. */
+	private openChannel: PluginSourceChannel | null = null;
 	private busy = false;
 
 	constructor(
@@ -84,6 +88,7 @@ export class VersionHistoryModal extends Modal {
 		nbBtn.addEventListener("click", () => {
 			this.tab = "notebook";
 			this.openSourceId = null;
+			this.openChannel = null;
 			this.render();
 		});
 		plBtn.addEventListener("click", () => {
@@ -190,34 +195,60 @@ export class VersionHistoryModal extends Modal {
 		await this.plugin.saveSettings();
 	}
 
+	/** Running package version = Obsidian-loaded manifest only. */
+	private installedVersion(): string {
+		return (this.plugin.manifest?.version as string | undefined) ?? "0.0.0";
+	}
+
+	private describeInstalledStatus(): string {
+		const installed = this.installedVersion();
+		const applied = this.plugin.settings.pluginHistory?.appliedPackage;
+		const lines = [
+			`本机正在运行：v${installed}（来自已加载的 manifest.json；GitHub 上有更新≠已经装上）`,
+		];
+		if (applied) {
+			const from =
+				applied.sourceId == null
+					? "本地运行备份"
+					: applied.sourceName || "GitHub 来源";
+			lines.push(
+				`本页上次成功切换：${from} · v${applied.version}（若未禁用再启用/重启，界面可能仍是旧代码）`,
+			);
+		} else {
+			lines.push(
+				"本页尚未成功「使用」过远程/备份包（列表里的远程版本只是可下载，不是当前运行）",
+			);
+		}
+		return lines.join("。") + "。";
+	}
+
 	private async renderPluginTrack(parent: HTMLElement): Promise<void> {
-		const installed =
-			(this.plugin.manifest?.version as string | undefined) ?? "0.0.0";
+		const installed = this.installedVersion();
 		const hist = this.plugin.settings.pluginHistory;
 
 		if (this.openSourceId) {
 			const src = this.getSources().find((s) => s.id === this.openSourceId);
 			if (src) {
-				await this.renderSourceReleases(parent, src, installed);
+				if (this.openChannel === "release" || this.openChannel === "tags") {
+					await this.renderChannelList(parent, src, this.openChannel, installed);
+				} else {
+					this.renderSourceHub(parent, src, installed);
+				}
 				return;
 			}
 			this.openSourceId = null;
+			this.openChannel = null;
 		}
 
 		parent.createEl("p", {
 			cls: "setting-item-description",
 			text:
-				`本机 manifest 版本：v${installed}` +
-				(hist.appliedPackage
-					? ` · 当前使用：${hist.appliedPackage.sourceName} · v${hist.appliedPackage.version}`
-					: " · 当前使用：尚未从历史页应用过（仅版本号相同≠正在用远程包）") +
-				`。` +
-				`本地备份与每个 GitHub 来源各是独立列表。` +
-				`「拉取版本」只更新可选列表（优先 Release 附件 → Tags → Code ZIP），不改运行包；` +
-				`只有「下载并使用 / 使用此版本 / 切换到此本地备份」成功后才标记当前使用。`,
+				this.describeInstalledStatus() +
+				"每个 GitHub 来源内部分「Release 安装包」与「Tags 源码包」两个独立列表，分开拉取、分开点开。" +
+				"Release 一般更干净（几乎只有插件三文件）；Tags 是整仓源码，作备选。" +
+				"「拉取」只更新列表，不改运行包；只有「下载并使用 / 使用此版本 / 切换到此本地备份」才会覆盖代码，且会先自动备份当前版本。",
 		});
 
-		// Add source row
 		const addBox = parent.createDiv({ cls: "ai-notebook-version-card" });
 		addBox.createEl("h4", { text: "添加 GitHub 版本来源" });
 		let nameVal = "";
@@ -254,24 +285,24 @@ export class VersionHistoryModal extends Modal {
 		if (sources.length === 0) {
 			parent.createDiv({
 				cls: "ai-notebook-empty",
-				text: "尚未添加来源。添加后可拉取版本（Release / Tags / 仓库快照）并切换。",
+				text: "尚未添加来源。添加后可分别拉取 Release 安装包与 Tags 源码包并切换。",
 			});
 		} else {
 			const list = parent.createDiv({ cls: "ai-notebook-provider-row-list" });
 			for (const src of sources) {
-				this.renderSourceRow(list, src, installed);
+				this.renderSourceRow(list, src);
 			}
 		}
 
-		// Local backups — switchable list (separate from GitHub sources)
 		const localBox = parent.createDiv({ cls: "ai-notebook-version-card" });
 		localBox.createEl("h4", { text: "本地运行备份" });
 		localBox.createEl("p", {
 			cls: "setting-item-description",
 			text:
-				"备份当前运行的安装包到 package-archive/v{版本}/，并在下方列表显示，可一键切换回来。" +
-				"与 GitHub 来源的同号版本分开列出（例如「本地备份 v0.2.0」≠「某来源 v0.2.0」）。" +
-				"启动时也会自动备份一次。切换只覆盖 main.js / manifest / styles，不碰 data.json 与笔记。",
+				"备份当前正在运行的安装包到 package-archive/v{版本}/，可一键切回。" +
+				"与 GitHub 来源的同号版本分开列出（「本地备份 v0.7.0」≠「某来源 v0.7.0」）。" +
+				"每次从历史页切换版本前也会自动先备份；若备份失败则中止切换。" +
+				"切换只覆盖 main.js / manifest / styles，不碰 data.json 与笔记。",
 		});
 		const archBtn = localBox.createEl("button", {
 			text: "立即备份当前安装包到本地存档",
@@ -295,16 +326,15 @@ export class VersionHistoryModal extends Modal {
 		});
 		void this.fillLocalBackupList(localListHost, installed);
 
-		// Optional: built-in capability log as reference (collapsed)
 		const caps = listPluginCapabilitiesNewestFirst();
 		if (caps.length > 0) {
 			const det = parent.createEl("details");
 			det.createEl("summary", {
-				text: "内置能力里程碑说明（补充参考，非安装包列表）",
+				text: "内置能力里程碑说明（补充参考，非安装包列表、也不是本机版本）",
 			});
 			const ref = det.createDiv({ cls: "setting-item-description" });
 			ref.setText(
-				"以下文案随插件代码发布，用于解释各版本大致能力；真正的安装包请从来源拉取。",
+				"以下文案随插件代码发布，只解释各版本大致能力；真正的安装版本以本机 manifest 为准，安装包请从来源的 Release/Tags 列表拉取。",
 			);
 			for (const cap of caps.slice(0, 12)) {
 				const line = det.createDiv({ cls: "ai-notebook-version-time" });
@@ -314,6 +344,10 @@ export class VersionHistoryModal extends Modal {
 
 		if (hist.userNotes.length > 0) {
 			parent.createEl("h3", { text: "你的操作记录" });
+			parent.createEl("p", {
+				cls: "setting-item-description",
+				text: "仅操作备忘，不代表本机正在运行的版本。本机版本请看上方「本机正在运行」。",
+			});
 			const notes = [...hist.userNotes].reverse().slice(0, 20);
 			for (const n of notes) {
 				const row = parent.createDiv({ cls: "ai-notebook-version-card" });
@@ -323,17 +357,13 @@ export class VersionHistoryModal extends Modal {
 				});
 				row.createDiv({
 					cls: "ai-notebook-version-time",
-					text: `${formatLocalDateTime(n.at)} · ${n.kind}${n.relatedPluginVersion ? ` · 目标包 ${n.relatedPluginVersion}` : ""}`,
+					text: `${formatLocalDateTime(n.at)} · ${n.kind}${n.relatedPluginVersion ? ` · 相关版本 ${n.relatedPluginVersion}` : ""}`,
 				});
 			}
 		}
 	}
 
-	private renderSourceRow(
-		list: HTMLElement,
-		src: PluginVersionSource,
-		installed: string,
-	): void {
+	private renderSourceRow(list: HTMLElement, src: PluginVersionSource): void {
 		const row = list.createDiv({ cls: "ai-notebook-provider-row" });
 		const main = row.createDiv({ cls: "ai-notebook-provider-row-main" });
 		const title = main.createDiv({ cls: "ai-notebook-provider-row-title" });
@@ -342,11 +372,17 @@ export class VersionHistoryModal extends Modal {
 			cls: "ai-notebook-provider-row-url",
 			text: src.repoUrl || `${src.owner}/${src.repo}`,
 		});
+		const relCount = (src.cachedReleases ?? []).length;
+		const tagCount = (src.cachedTags ?? []).length;
 		const metaBits = [
-			src.lastFetchedAt
-				? `上次拉取 ${formatLocalDateTime(src.lastFetchedAt)}`
-				: "尚未拉取",
-			`远程缓存 ${src.cachedReleases.length} 个版本`,
+			`Release ${relCount} 个` +
+				(src.lastFetchedReleaseAt
+					? `（${formatLocalDateTime(src.lastFetchedReleaseAt)}）`
+					: "（未拉取）"),
+			`Tags ${tagCount} 个` +
+				(src.lastFetchedTagsAt
+					? `（${formatLocalDateTime(src.lastFetchedTagsAt)}）`
+					: "（未拉取）"),
 		];
 		main.createDiv({
 			cls: "ai-notebook-provider-row-meta",
@@ -354,21 +390,104 @@ export class VersionHistoryModal extends Modal {
 		});
 
 		const actions = row.createDiv({ cls: "ai-notebook-provider-row-actions" });
-		const fetchBtn = actions.createEl("button", { text: "拉取版本" });
-		fetchBtn.addEventListener("click", () => {
-			void this.fetchSource(src.id);
-		});
-		const openBtn = actions.createEl("button", { text: "打开版本" });
+		const openBtn = actions.createEl("button", { text: "打开" });
 		openBtn.addClass("mod-cta");
 		openBtn.addEventListener("click", () => {
 			this.openSourceId = src.id;
+			this.openChannel = null;
 			this.render();
 		});
 		const delBtn = actions.createEl("button", { text: "删除" });
 		delBtn.addEventListener("click", () => {
 			void this.removeSource(src.id);
 		});
-		void installed; // reserved for future badge
+	}
+
+	/** Source hub: two separate channel entries. */
+	private renderSourceHub(
+		parent: HTMLElement,
+		src: PluginVersionSource,
+		_installed: string,
+	): void {
+		const back = parent.createEl("button", { text: "← 返回来源列表" });
+		back.addEventListener("click", () => {
+			this.openSourceId = null;
+			this.openChannel = null;
+			this.render();
+		});
+
+		parent.createEl("h3", { text: `${src.name}` });
+		parent.createEl("p", {
+			cls: "setting-item-description",
+			text:
+				`${src.owner}/${src.repo}。` +
+				this.describeInstalledStatus() +
+				"请分别进入下方两个列表；Release 优先用于换插件文件，Tags 作备选。",
+		});
+
+		const list = parent.createDiv({ cls: "ai-notebook-provider-row-list" });
+
+		{
+			const row = list.createDiv({ cls: "ai-notebook-provider-row" });
+			const main = row.createDiv({ cls: "ai-notebook-provider-row-main" });
+			main.createDiv({ cls: "ai-notebook-provider-row-title" }).createSpan({
+				text: "Release 安装包",
+			});
+			main.createDiv({
+				cls: "ai-notebook-provider-row-url",
+				text: "GitHub 发布页附件（ai-notebook-*.zip 等），文件少、更适合直接替换插件",
+			});
+			const n = (src.cachedReleases ?? []).length;
+			main.createDiv({
+				cls: "ai-notebook-provider-row-meta",
+				text: src.lastFetchedReleaseAt
+					? `已缓存 ${n} 个 · 上次拉取 ${formatLocalDateTime(src.lastFetchedReleaseAt)}`
+					: `尚未拉取 · 缓存 ${n} 个`,
+			});
+			const actions = row.createDiv({ cls: "ai-notebook-provider-row-actions" });
+			const fetchBtn = actions.createEl("button", { text: "拉取 Release" });
+			fetchBtn.addEventListener("click", () => {
+				void this.fetchSourceChannel(src.id, "release");
+			});
+			const openBtn = actions.createEl("button", { text: "打开列表" });
+			openBtn.addClass("mod-cta");
+			openBtn.addEventListener("click", () => {
+				this.openSourceId = src.id;
+				this.openChannel = "release";
+				this.render();
+			});
+		}
+
+		{
+			const row = list.createDiv({ cls: "ai-notebook-provider-row" });
+			const main = row.createDiv({ cls: "ai-notebook-provider-row-main" });
+			main.createDiv({ cls: "ai-notebook-provider-row-title" }).createSpan({
+				text: "Tags 源码包",
+			});
+			main.createDiv({
+				cls: "ai-notebook-provider-row-url",
+				text: "打 tag 时的整仓 ZIP，文件多；安装时再提取 release/ai-notebook 或根目录三文件",
+			});
+			const n = (src.cachedTags ?? []).length;
+			main.createDiv({
+				cls: "ai-notebook-provider-row-meta",
+				text: src.lastFetchedTagsAt
+					? `已缓存 ${n} 个 · 上次拉取 ${formatLocalDateTime(src.lastFetchedTagsAt)}`
+					: `尚未拉取 · 缓存 ${n} 个`,
+			});
+			const actions = row.createDiv({ cls: "ai-notebook-provider-row-actions" });
+			const fetchBtn = actions.createEl("button", { text: "拉取 Tags" });
+			fetchBtn.addEventListener("click", () => {
+				void this.fetchSourceChannel(src.id, "tags");
+			});
+			const openBtn = actions.createEl("button", { text: "打开列表" });
+			openBtn.addClass("mod-cta");
+			openBtn.addEventListener("click", () => {
+				this.openSourceId = src.id;
+				this.openChannel = "tags";
+				this.render();
+			});
+		}
 	}
 
 	private async addSource(name: string, url: string): Promise<void> {
@@ -377,8 +496,7 @@ export class VersionHistoryModal extends Modal {
 			new Notice(parsed.error);
 			return;
 		}
-		const display =
-			name.trim() || `${parsed.owner}/${parsed.repo}`;
+		const display = name.trim() || `${parsed.owner}/${parsed.repo}`;
 		const entry: PluginVersionSource = {
 			id: createId(),
 			name: display,
@@ -386,11 +504,16 @@ export class VersionHistoryModal extends Modal {
 			owner: parsed.owner,
 			repo: parsed.repo,
 			lastFetchedAt: null,
+			lastFetchedReleaseAt: null,
+			lastFetchedTagsAt: null,
 			cachedReleases: [],
+			cachedTags: [],
 		};
 		const sources = [...this.getSources(), entry];
 		await this.saveSources(sources);
-		new Notice(`已添加来源「${display}」。点「拉取版本」获取安装包列表（不会改当前运行包）。`);
+		new Notice(
+			`已添加来源「${display}」。打开后来分别拉取 Release / Tags（不会改当前运行包）。`,
+		);
 		this.render();
 	}
 
@@ -402,34 +525,51 @@ export class VersionHistoryModal extends Modal {
 		);
 		if (!ok) return;
 		await this.saveSources(this.getSources().filter((s) => s.id !== id));
-		if (this.openSourceId === id) this.openSourceId = null;
+		if (this.openSourceId === id) {
+			this.openSourceId = null;
+			this.openChannel = null;
+		}
 		new Notice("已删除来源");
 		this.render();
 	}
 
-	private async fetchSource(id: string): Promise<void> {
+	private async fetchSourceChannel(
+		id: string,
+		channel: PluginSourceChannel,
+	): Promise<void> {
 		if (this.busy) return;
 		const src = this.getSources().find((s) => s.id === id);
 		if (!src) return;
 		this.busy = true;
-		new Notice(`正在从 GitHub 拉取 ${src.owner}/${src.repo} …`);
+		const label = channel === "release" ? "Release 安装包" : "Tags 源码包";
+		new Notice(`正在拉取 ${label}：${src.owner}/${src.repo} …`);
 		try {
-			const result = await fetchGithubReleases(src.owner, src.repo);
+			const result = await fetchGithubChannel(src.owner, src.repo, channel);
 			if (!result.ok) {
 				new Notice(result.error, 12000);
 				return;
 			}
-			const updated: PluginVersionSource = {
-				...src,
-				lastFetchedAt: new Date().toISOString(),
-				cachedReleases: result.releases,
-			};
+			const now = new Date().toISOString();
+			const updated: PluginVersionSource =
+				channel === "release"
+					? {
+							...src,
+							lastFetchedAt: now,
+							lastFetchedReleaseAt: now,
+							cachedReleases: result.releases,
+						}
+					: {
+							...src,
+							lastFetchedAt: now,
+							lastFetchedTagsAt: now,
+							cachedTags: result.releases,
+						};
 			await this.saveSources(
 				this.getSources().map((s) => (s.id === id ? updated : s)),
 			);
 			const hint = (result.trace ?? []).slice(-3).join(" · ");
 			new Notice(
-				`已缓存 ${result.releases.length} 个可安装版本（未改变当前运行包）。` +
+				`「${label}」已缓存 ${result.releases.length} 个版本（未改变当前运行包）。` +
 					(hint ? ` ${hint}` : ""),
 				10000,
 			);
@@ -439,49 +579,63 @@ export class VersionHistoryModal extends Modal {
 		}
 	}
 
-	private async renderSourceReleases(
+	private async renderChannelList(
 		parent: HTMLElement,
 		src: PluginVersionSource,
-		installed: string,
+		channel: PluginSourceChannel,
+		_installed: string,
 	): Promise<void> {
-		const back = parent.createEl("button", { text: "← 返回来源列表" });
+		const back = parent.createEl("button", {
+			text: "← 返回该来源（Release / Tags）",
+		});
 		back.addEventListener("click", () => {
-			this.openSourceId = null;
+			this.openChannel = null;
 			this.render();
 		});
 
-		parent.createEl("h3", { text: `${src.name} · 版本列表` });
+		const channelTitle =
+			channel === "release" ? "Release 安装包" : "Tags 源码包";
+		parent.createEl("h3", { text: `${src.name} · ${channelTitle}` });
+
+		const fresh = this.getSources().find((s) => s.id === src.id) ?? src;
+		const lastAt =
+			channel === "release"
+				? fresh.lastFetchedReleaseAt
+				: fresh.lastFetchedTagsAt;
+		const releases =
+			channel === "release"
+				? fresh.cachedReleases ?? []
+				: fresh.cachedTags ?? [];
+
 		parent.createEl("p", {
 			cls: "setting-item-description",
 			text:
-				`${src.owner}/${src.repo}` +
-				(src.lastFetchedAt
-					? ` · 上次拉取 ${formatLocalDateTime(src.lastFetchedAt)}`
-					: " · 尚未拉取，请点「拉取版本」") +
+				`${src.owner}/${src.repo} · ${channelTitle}` +
+				(lastAt
+					? ` · 上次拉取 ${formatLocalDateTime(lastAt)}`
+					: " · 尚未拉取，请点下方刷新") +
 				`。下载只写入 package-archive/by-source/${src.id}/v…/；` +
-				`「使用此版本」才会覆盖运行包并标记当前使用。` +
-				`本机 manifest v${installed}` +
-				(this.plugin.settings.pluginHistory.appliedPackage
-					? ` · 当前使用：${this.plugin.settings.pluginHistory.appliedPackage.sourceName} v${this.plugin.settings.pluginHistory.appliedPackage.version}`
-					: " · 尚未从历史页应用过远程包") +
-				`。`,
+				`「使用此版本」会先备份当前运行包，再覆盖代码。` +
+				this.describeInstalledStatus(),
 		});
 
 		const toolbar = parent.createDiv({ cls: "ai-notebook-settings-actions" });
-		const fetchBtn = toolbar.createEl("button", { text: "拉取 / 刷新版本" });
+		const fetchBtn = toolbar.createEl("button", {
+			text:
+				channel === "release" ? "拉取 / 刷新 Release" : "拉取 / 刷新 Tags",
+		});
 		fetchBtn.addClass("mod-cta");
 		fetchBtn.addEventListener("click", () => {
-			void this.fetchSource(src.id);
+			void this.fetchSourceChannel(src.id, channel);
 		});
-
-		// re-read after potential fetch
-		const fresh = this.getSources().find((s) => s.id === src.id) ?? src;
-		const releases = fresh.cachedReleases;
 
 		if (releases.length === 0) {
 			parent.createDiv({
 				cls: "ai-notebook-empty",
-				text: "暂无版本缓存。点「拉取 / 刷新版本」：优先 Release 安装包 → 否则 Tags → 再否则 Code Download ZIP。",
+				text:
+					channel === "release"
+						? "暂无 Release 安装包缓存。点「拉取 / 刷新 Release」：只列带 zip 附件的 GitHub Release（与 Tags 列表互不干扰）。"
+						: "暂无 Tags 源码包缓存。点「拉取 / 刷新 Tags」：列仓库 tag / 源码 zip（与 Release 列表互不干扰）。",
 			});
 			return;
 		}
@@ -489,7 +643,7 @@ export class VersionHistoryModal extends Modal {
 		for (let i = 0; i < releases.length; i++) {
 			const rel = releases[i]!;
 			const prev = releases[i + 1];
-			await this.renderReleaseCard(parent, fresh, rel, prev, installed);
+			await this.renderReleaseCard(parent, fresh, rel, prev, channel);
 		}
 	}
 
@@ -498,7 +652,7 @@ export class VersionHistoryModal extends Modal {
 		src: PluginVersionSource,
 		rel: PluginReleaseCacheEntry,
 		prev: PluginReleaseCacheEntry | undefined,
-		installed: string,
+		channel: PluginSourceChannel,
 	): Promise<void> {
 		const row = parent.createDiv({ cls: "ai-notebook-version-card" });
 		const applied = this.plugin.settings.pluginHistory.appliedPackage;
@@ -510,7 +664,7 @@ export class VersionHistoryModal extends Modal {
 
 		const head = row.createDiv({ cls: "ai-notebook-version-card-head" });
 		head.createEl("h4", {
-			text: `v${rel.version}${isCurrent ? "（当前使用）" : ""}`,
+			text: `v${rel.version}${isCurrent ? "（本页标记为已应用）" : ""}`,
 		});
 		head.createSpan({
 			cls: "ai-notebook-version-author",
@@ -518,7 +672,9 @@ export class VersionHistoryModal extends Modal {
 		});
 		head.createSpan({
 			cls: "ai-notebook-version-author",
-			text: rel.fetchChannelLabel || channelLabel(rel.fetchChannel),
+			text:
+				rel.fetchChannelLabel ||
+				(channel === "release" ? "Release 安装包" : "Tags 源码包"),
 		});
 
 		row.createDiv({
@@ -529,17 +685,19 @@ export class VersionHistoryModal extends Modal {
 			cls: "ai-notebook-version-time",
 			text: rel.publishedAt
 				? `发布：${formatLocalDateTime(rel.publishedAt)}（${formatRelative(rel.publishedAt)}）`
-				: "发布时间未知",
+				: channel === "tags"
+					? "Tags 一般无发布时间"
+					: "发布时间未知",
 		});
 
 		const detailsBox = row.createDiv({ cls: "ai-notebook-version-details" });
 		detailsBox.createDiv({
 			cls: "ai-notebook-version-details-label",
-			text: "版本说明 / 相对变化",
+			text: "版本说明",
 		});
 		const ul = detailsBox.createEl("ul");
 		ul.createEl("li", {
-			text: `拉取方式：${rel.fetchChannelLabel || channelLabel(rel.fetchChannel)}`,
+			text: `列表：${channel === "release" ? "Release 安装包（独立）" : "Tags 源码包（独立）"}`,
 		});
 		const bodyLines = summarizeReleaseBody(rel.body, 10);
 		if (bodyLines.length) {
@@ -547,7 +705,6 @@ export class VersionHistoryModal extends Modal {
 		} else {
 			ul.createEl("li", { text: "暂无更多说明正文。" });
 		}
-		// built-in capability hints for same version
 		const caps = listPluginCapabilitiesNewestFirst().filter(
 			(c) => c.pluginVersion === rel.version,
 		);
@@ -558,7 +715,7 @@ export class VersionHistoryModal extends Modal {
 		}
 		if (prev) {
 			ul.createEl("li", {
-				text: `上一缓存版本：v${prev.version}（对比请以 Release 说明为准）`,
+				text: `本列表上一版：v${prev.version}`,
 			});
 		}
 
@@ -566,10 +723,14 @@ export class VersionHistoryModal extends Modal {
 			src.id,
 			rel.version,
 		);
+		const installed = this.installedVersion();
 		const statusBits: string[] = [];
-		if (isCurrent) statusBits.push("状态：当前使用（已从本条应用）");
-		else if (hasLocal) statusBits.push("状态：已下载到本地（未作为当前使用）");
+		if (isCurrent) statusBits.push("本页标记：已应用此条");
+		else if (hasLocal) statusBits.push("状态：已下载到本地（未作为本页应用）");
 		else statusBits.push("状态：未下载");
+		if (installed === rel.version) {
+			statusBits.push(`本机 manifest 也是 v${installed}（仅号相同≠一定来自此条）`);
+		}
 		if (hasLocal) {
 			statusBits.push(
 				`存档：package-archive/by-source/${src.id}/v${rel.version}`,
@@ -594,10 +755,22 @@ export class VersionHistoryModal extends Modal {
 		useBtn.addEventListener("click", () => {
 			void this.useRelease(src, rel, hasLocal);
 		});
-		if (rel.htmlUrl) {
-			const open = actions.createEl("button", { text: "打开 Release 页" });
+		if (rel.htmlUrl || channel === "tags") {
+			const open = actions.createEl("button", {
+				text: channel === "release" ? "打开 Release 页" : "打开标签页",
+			});
 			open.addEventListener("click", () => {
-				window.open(rel.htmlUrl, "_blank");
+				// Tags must open the tag tree / Tags area — never the Release notes page,
+				// even if older cache still stored releases/tag/... as htmlUrl.
+				const url =
+					channel === "tags"
+						? githubTagBrowseUrl(
+								src.owner,
+								src.repo,
+								rel.tagName || `v${rel.version}`,
+							)
+						: rel.htmlUrl;
+				if (url) window.open(url, "_blank");
 			});
 		}
 	}
@@ -638,10 +811,11 @@ export class VersionHistoryModal extends Modal {
 			`将插件代码切换为：\n\n` +
 				`来源：${src.name}\n` +
 				`版本：v${rel.version}\n\n` +
-				`· 会先备份当前运行包\n` +
+				`· 会先备份当前运行包到「本地运行备份」；备份失败则中止，不覆盖\n` +
 				`· 再覆盖 main.js / manifest.json / styles.css\n` +
 				`· 不修改 data.json，不改任何笔记\n` +
-				`· 完成后请禁用再启用本插件，或重启 Obsidian\n\n` +
+				`· 若切换失败，可到「本地运行备份」一键切回\n` +
+				`· 成功后请禁用再启用本插件，或重启 Obsidian\n\n` +
 				(hasLocal ? "" : "本地尚无存档，将先下载再切换。\n"),
 		);
 		if (!ok) return;
@@ -662,13 +836,13 @@ export class VersionHistoryModal extends Modal {
 					return;
 				}
 			}
-			new Notice("正在切换安装包…");
+			new Notice("正在备份当前版本并切换安装包…");
 			const result = await this.plugin.packageArchive.switchToPackage(
 				rel.version,
 				{ sourceId: src.id, sourceName: src.name },
 			);
 			if (!result.ok) {
-				new Notice(result.error);
+				new Notice(result.error, 14000);
 				return;
 			}
 			this.plugin.settings = recordRollbackIntent(
@@ -689,7 +863,7 @@ export class VersionHistoryModal extends Modal {
 			};
 			await this.plugin.saveSettings();
 			new Notice(
-				`已应用「${src.name}」v${rel.version}（${rel.fetchChannelLabel || "远程包"}）。请立即：禁用再启用「AI 记录本」，或重启 Obsidian。`,
+				`已应用「${src.name}」v${rel.version}。上一版已留在「本地运行备份」。请立即：禁用再启用「AI 记录本」，或重启 Obsidian。`,
 				12000,
 			);
 			this.render();
@@ -707,22 +881,26 @@ export class VersionHistoryModal extends Modal {
 		if (backups.length === 0) {
 			host.createDiv({
 				cls: "ai-notebook-empty",
-				text: "暂无本地备份。点上方「立即备份」后会出现在这里，并可一键切换。",
+				text: "暂无本地备份。点上方「立即备份」或在切换版本时会自动备份；失败时可从这里恢复。",
 			});
 			return;
 		}
 		for (const bak of backups) {
 			const row = host.createDiv({ cls: "ai-notebook-version-card" });
 			const applied = this.plugin.settings.pluginHistory.appliedPackage;
-			const isCurrent =
+			const isAppliedLocal =
 				!!applied &&
 				applied.sourceId == null &&
 				applied.version === bak.version;
-			if (isCurrent) row.addClass("is-current");
+			const matchesInstalled = bak.version === installed;
+			if (isAppliedLocal) row.addClass("is-current");
 
 			const head = row.createDiv({ cls: "ai-notebook-version-card-head" });
+			const tags: string[] = [];
+			if (isAppliedLocal) tags.push("本页标记已应用");
+			if (matchesInstalled) tags.push("与本机 manifest 同号");
 			head.createEl("h4", {
-				text: `v${bak.version}${isCurrent ? "（当前使用 · 本地备份）" : ""}`,
+				text: `v${bak.version}${tags.length ? `（${tags.join(" · ")}）` : ""}`,
 			});
 			head.createSpan({
 				cls: "ai-notebook-version-author",
@@ -758,27 +936,22 @@ export class VersionHistoryModal extends Modal {
 	private async switchLocalBackup(version: string): Promise<void> {
 		if (this.busy) return;
 		const ok = confirm(
-			`将插件代码切换为「本地备份」v${version}？
-
-` +
-				`· 会先再备份一次当前运行包
-` +
-				`· 再覆盖 main.js / manifest.json / styles.css
-` +
-				`· 不修改 data.json，不改任何笔记
-` +
+			`将插件代码切换为「本地备份」v${version}？\n\n` +
+				`· 会先再备份一次当前运行包；备份失败则中止\n` +
+				`· 再覆盖 main.js / manifest.json / styles.css\n` +
+				`· 不修改 data.json，不改任何笔记\n` +
 				`· 完成后请禁用再启用本插件，或重启 Obsidian`,
 		);
 		if (!ok) return;
 		this.busy = true;
 		try {
-			new Notice("正在切换到本地备份…");
+			new Notice("正在备份当前版本并切换到本地备份…");
 			const result = await this.plugin.packageArchive.switchToPackage(version, {
 				sourceId: null,
 				sourceName: "本地运行备份",
 			});
 			if (!result.ok) {
-				new Notice(result.error);
+				new Notice(result.error, 14000);
 				return;
 			}
 			this.plugin.settings = recordRollbackIntent(
@@ -887,12 +1060,4 @@ function formatRelative(iso: string): string {
 	const mon = Math.round(day / 30);
 	if (mon < 12) return `${mon} 个月前`;
 	return `${Math.round(mon / 12)} 年前`;
-}
-
-
-function channelLabel(ch?: string | null): string {
-	if (ch === "release") return "Release 附件";
-	if (ch === "tags") return "Tags 源码包";
-	if (ch === "code") return "Code Download ZIP";
-	return "远程包";
 }
